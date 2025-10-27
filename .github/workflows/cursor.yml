@@ -1,4 +1,4 @@
-name: "AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
+name: "Cursor AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
 
 on:
   workflow_dispatch:
