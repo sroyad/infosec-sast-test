@@ -1,0 +1,188 @@
+name: "CodeQL Advanced (Optimized, Multi-Lang, Stable)"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ "main" ]
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: "31 19 * * 0"
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+  packages: read
+
+jobs:
+  detect:
+    name: Detect languages
+    runs-on: ubuntu-latest
+    outputs:
+      langs_json: ${{ steps.scan.outputs.langs_json }}
+      langs_csv:  ${{ steps.scan.outputs.langs_csv }}
+      cs_found:   ${{ steps.scan.outputs.cs_found }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Debug file listing
+        run: |
+          echo "=== git ls-files (head) ==="
+          git ls-files | head -n 50 || true
+          echo "=== repo tree (top-level) ==="
+          ls -la || true
+
+      - id: scan
+        shell: bash
+        run: |
+          langs=()
+          cs_found="false"
+
+          # Java/Kotlin
+          if git ls-files '*.java' '*.kt' '*.kts' | grep -q .; then langs+=("java"); fi
+          # JavaScript / TypeScript
+          if git ls-files '*.js' '*.jsx' '*.ts' '*.tsx' | grep -q .; then langs+=("javascript"); fi
+          # Python
+          if git ls-files '*.py' | grep -q .; then langs+=("python"); fi
+          # Go
+          if git ls-files '*.go' | grep -q .; then langs+=("go"); fi
+          # Ruby
+          if git ls-files '*.rb' | grep -q .; then langs+=("ruby"); fi
+          # C / C++  (analyze w/o autobuild)
+          if git ls-files '*.c' '*.cc' '*.cpp' '*.cxx' '*.h' '*.hpp' | grep -q .; then langs+=("cpp"); fi
+          # C# (handled in a separate Windows job)
+          if git ls-files '*.cs' | grep -q .; then cs_found="true"; fi
+
+          if [ ${#langs[@]} -eq 0 ]; then
+            echo "No linux-scannable languages detected."
+            echo "langs_csv=" >> "$GITHUB_OUTPUT"
+            echo 'langs_json=[]' >> "$GITHUB_OUTPUT"
+            echo "cs_found=$cs_found" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          csv="$(IFS=,; echo "${langs[*]}")"
+          json="$(printf '[%s]' "$(printf '"%s",' "${langs[@]}" | sed 's/,$//')")"
+
+          echo "Detected languages (linux): $csv  |  C# present: $cs_found"
+          echo "langs_csv=$csv"   >> "$GITHUB_OUTPUT"
+          echo "langs_json=$json" >> "$GITHUB_OUTPUT"
+          echo "cs_found=$cs_found" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: CodeQL Optimized • ${{ matrix.language }}
+    needs: detect
+    if: ${{ needs.detect.outputs.langs_json != '' && needs.detect.outputs.langs_json != '[]' }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJson(needs.detect.outputs.langs_json) }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Setup Node (for JS/TS)
+        if: ${{ matrix.language == 'javascript' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Write CodeQL config (optimized)
+        shell: bash
+        run: |
+          mkdir -p .github/codeql-config
+          cat > .github/codeql-config/codeql-config.yml <<'YAML'
+          name: org-optimized
+          paths-ignore:
+            - "**/test/**"
+            - "**/__tests__/**"
+            - "**/spec/**"
+            - "**/jest/**"
+            - "**/target/**"
+            - "**/build/**"
+            - "**/dist/**"
+            - "**/coverage/**"
+            - "**/node_modules/**"
+            - "**/vendor/**"
+            - "**/.venv/**"
+            - "**/.tox/**"
+            - "**/*.min.js"
+            - "**/generated/**"
+          queries:
+            - uses: security-extended
+            - uses: security-and-quality
+          YAML
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql-config/codeql-config.yml
+          ram: 8192
+          threads: 0
+
+      # Autobuild Java ONLY when a build file is present; never autobuild C/C++
+      - name: Autobuild (Java when build files present)
+        if: ${{ matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '') }}
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Skip autobuild
+        if: ${{ !(matrix.language == 'java' && (hashFiles('**/pom.xml') != '' || hashFiles('**/build.gradle*') != '')) }}
+        run: echo "Autobuild skipped for ${{ matrix.language }}."
+
+      - name: Analyze (${{ matrix.language }})
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{ matrix.language }}/optimized"
+        timeout-minutes: 60
+
+  analyze-csharp:
+    name: CodeQL Optimized • csharp (Windows)
+    needs: detect
+    if: ${{ needs.detect.outputs.cs_found == 'true' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Write CodeQL config (optimized)
+        shell: bash
+        run: |
+          mkdir -p .github/codeql-config
+          cat > .github/codeql-config/codeql-config.yml <<'YAML'
+          name: org-optimized
+          paths-ignore:
+            - "**/test/**"
+            - "**/__tests__/**"
+            - "**/spec/**"
+            - "**/bin/**"
+            - "**/obj/**"
+            - "**/dist/**"
+            - "**/coverage/**"
+            - "**/generated/**"
+          queries:
+            - uses: security-extended
+            - uses: security-and-quality
+          YAML
+
+      - name: Initialize CodeQL (csharp)
+        uses: github/codeql-action/init@v4
+        with:
+          languages: csharp
+          config-file: ./.github/codeql-config/codeql-config.yml
+          ram: 8192
+          threads: 0
+
+      - name: Autobuild (csharp)
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Analyze (csharp)
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:csharp/optimized"
+        timeout-minutes: 60
