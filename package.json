@@ -1,0 +1,16 @@
+{
+  "name": "infosec-sast-test",
+  "version": "1.0.0",
+  "description": "Security testing examples",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
