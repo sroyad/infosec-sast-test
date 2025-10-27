@@ -3,7 +3,7 @@ name: "Cursor AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -12,7 +12,6 @@ permissions:
 
 jobs:
   ai-triage-cursor:
-    name: AI Triage & Summary Existing Alerts
     runs-on: ubuntu-latest
     env:
       OWNER: ${{ github.repository_owner }}
@@ -20,8 +19,8 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Cursor
-      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}   # <-- create at org level
-      CURSOR_MODEL: "claude-3-7-sonnet"               # or another long-context model
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      CURSOR_MODEL: "claude-3-7-sonnet"      # used if your CLI supports a model flag
       CURSOR_RULES: ".github/tools/cursor-rules.md"
 
       # Triage knobs
@@ -32,10 +31,9 @@ jobs:
       SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
 
     steps:
-      - name: Checkout (for code context)
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Install system deps
         run: |
@@ -44,7 +42,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install requests pexpect
 
-      - name: Setup Node 20 (some Cursor wrappers expect Node on PATH)
+      - name: Setup Node 20 (some Cursor wrappers expect Node)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -56,24 +54,37 @@ jobs:
           echo "$HOME/.local/bin" >> $GITHUB_PATH
           echo "$HOME/.cursor/bin" >> $GITHUB_PATH
           which cursor-agent || { echo "cursor-agent not found on PATH"; exit 1; }
-          cursor-agent -v
+          cursor-agent -v || true
 
-      - name: Validate Cursor auth
+      - name: Validate Cursor auth (flag-agnostic)
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: ${{ env.CURSOR_MODEL }}
+        shell: bash
         run: |
           test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY not set"; exit 1; }
-          cursor-agent -p -m "${CURSOR_MODEL}" -f <(echo ok) >/dev/null
+          HELP="$(cursor-agent --help 2>/dev/null || true)"
+          if echo "$HELP" | grep -q -- '--model'; then
+            cursor-agent -p --model "$CURSOR_MODEL" -f <(echo ok) >/dev/null
+          elif echo "$HELP" | grep -q ' -m '; then
+            cursor-agent -p -m "$CURSOR_MODEL" -f <(echo ok) >/dev/null
+          else
+            # No model flag supported—run with defaults
+            cursor-agent -p -f <(echo ok) >/dev/null
+          fi
+          echo "Auth & CLI sanity OK."
 
       - name: Ensure rules file exists
         run: |
           test -f "$CURSOR_RULES" || { echo "Missing $CURSOR_RULES"; exit 1; }
-          echo "Using Cursor Rules at $CURSOR_RULES"
 
       - name: Triage existing Code Scanning alerts with Cursor
         id: triage
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: ${{ env.CURSOR_MODEL }}
+          CURSOR_RULES: ${{ env.CURSOR_RULES }}
+        shell: bash
         run: |
           python3 - << 'PY'
           import os, json, re, textwrap, subprocess, tempfile, pathlib, requests
@@ -84,7 +95,7 @@ jobs:
           AUTO_DISMISS=os.getenv("AUTO_DISMISS","false").lower()=="true"
           DISMISS_REASON=os.getenv("DISMISS_REASON","false positive")
           SAFE_HINTS=[s.strip().lower() for s in os.getenv("SAFE_PATH_HINTS","").split(",") if s.strip()]
-          CURSOR_MODEL=os.getenv("CURSOR_MODEL","claude-3-7-sonnet")
+          CURSOR_MODEL=os.getenv("CURSOR_MODEL","")
           CURSOR_RULES=os.getenv("CURSOR_RULES",".github/tools/cursor-rules.md")
           SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
           repo_root = pathlib.Path(".").resolve()
@@ -100,10 +111,8 @@ jobs:
           def read_file(path):
             p = repo_root / path
             if not p.exists(): return None
-            try:
-              return p.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-              return None
+            try: return p.read_text(encoding="utf-8", errors="ignore")
+            except Exception: return None
 
           def lines_with_numbers(s, start, end, ctx=12):
             lines = (s or "").splitlines()
@@ -115,10 +124,8 @@ jobs:
             return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
 
           def rg(pattern):
-            try:
-              return run(["rg","-n","--no-messages",pattern,"."]).splitlines()
-            except subprocess.CalledProcessError:
-              return []
+            try: return run(["rg","-n","--no-messages",pattern,"."]).splitlines()
+            except subprocess.CalledProcessError: return []
 
           def build_ctags():
             tags = {}
@@ -134,8 +141,7 @@ jobs:
                 if len(parts) < 4: continue
                 sym, file = parts[0], parts[1]
                 tags.setdefault(sym, set()).add(file)
-            except Exception:
-              pass
+            except Exception: pass
             return tags
 
           TAGS = build_ctags()
@@ -144,8 +150,7 @@ jobs:
             out=set()
             for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", snippet or ""):
               if tok in ("import","from","class","function","return","const","let","var","public","private","protected"): continue
-              if tok[0].isupper() or "_" in tok or len(tok) > 5:
-                out.add(tok)
+              if tok[0].isupper() or "_" in tok or len(tok) > 5: out.add(tok)
             return list(out)[:50]
 
           def gather_context(path, start, end):
@@ -166,16 +171,14 @@ jobs:
             # defs of symbols in snippet
             for sym in symbol_candidates(snippet):
               for f in TAGS.get(sym, []):
-                if pathlib.Path(f).exists():
-                  files.add(f)
+                if pathlib.Path(f).exists(): files.add(f)
 
             # neighbor hits by ripgrep
             for sym in symbol_candidates(snippet)[:15]:
-              for line in rg(rf'\b{re.escape(sym)}\b')[:50]:
+              for line in rg(rf'\\b{re.escape(sym)}\\b')[:50]:
                 f=line.split(":")[0]
                 if f.startswith("./"): f=f[2:]
-                if pathlib.Path(f).is_file():
-                  files.add(f)
+                if pathlib.Path(f).is_file(): files.add(f)
 
             noisey=("node_modules/","vendor/","dist/","build/","coverage/","min.js")
             files={f for f in files if not any(n in f for n in noisey)}
@@ -185,16 +188,25 @@ jobs:
             p = (p or "").lower()
             return any(h in p for h in SAFE_HINTS)
 
+          # detect model flag support once
+          def detect_model_flag():
+            try:
+              help_txt = subprocess.check_output(["cursor-agent","--help"], text=True, stderr=subprocess.STDOUT)
+              if "--model" in help_txt: return "--model"
+              if re.search(r'\\s-m\\s', help_txt): return "-m"
+            except Exception: pass
+            return None
+
+          MODEL_FLAG = detect_model_flag()
+
           def cursor_run(prompt_text, files):
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as pf:
-              pf.write(prompt_text)
-              pf.flush()
-              args = ["cursor-agent","-p","-m",os.getenv("CURSOR_MODEL","claude-3-7-sonnet"),
-                      "--rules", CURSOR_RULES,
-                      "--format","text",
-                      "--timeout","180"]
-              for f in files:
-                args += ["-a", f]
+              pf.write(prompt_text); pf.flush()
+              args = ["cursor-agent","-p","--rules", CURSOR_RULES,"--format","text","--timeout","180"]
+              # use model flag only if supported
+              if MODEL_FLAG and CURSOR_MODEL:
+                args += [MODEL_FLAG, CURSOR_MODEL]
+              for f in files: args += ["-a", f]
               args += ["-f", pf.name]
               try:
                 out = subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
@@ -240,7 +252,7 @@ jobs:
 
             REQUIREMENTS:
             - Use attached files to validate dataflow/control-flow before deciding FP/TP.
-            - If source is user-controlled AND reaches a sink with insufficient sanitization → TP with proof (paths/files).
+            - If source is user-controlled AND reaches a sink with insufficient sanitization → TP (cite files/lines).
             - If sanitized/guarded/constant/unused → FP (cite exact code).
             - If insufficient evidence → UNCERTAIN; list what extra files/paths are missing.
             """
@@ -259,14 +271,13 @@ jobs:
             loc=(inst.get("location") or {})
             path=loc.get("path") or ""; start=loc.get("start_line") or 1; end=loc.get("end_line") or start
             file_text = read_file(path)
-            if not file_text:
-              continue
+            if not file_text: continue
             snippet, ctx_files = gather_context(path, start, end)
 
             ai_text = cursor_run(make_prompt(a, snippet), ctx_files)
 
             parsed=None
-            m = re.search(r'\{.*\}\s*$', ai_text, flags=re.S)
+            m = re.search(r'\\{.*\\}\\s*$', ai_text, flags=re.S)
             if m:
               try: parsed=json.loads(m.group(0))
               except Exception: pass
@@ -285,14 +296,13 @@ jobs:
               "dismissed": False
             }
 
-            if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and path and (path.lower() and any(h in path.lower() for h in SAFE_HINTS)):
+            if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and path and any(h in path.lower() for h in SAFE_HINTS):
               url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
               r = sess.patch(url, json={"state": "dismissed", "dismissed_reason": DISMISS_REASON}, timeout=60)
               rec["dismissed"] = r.status_code in (200,201)
 
             triaged.append(rec)
 
-          # 3) Summary table
           md = [
             f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'Yes' if AUTO_DISMISS else 'No'}",
             "",
@@ -302,8 +312,7 @@ jobs:
           for r in triaged:
             md.append(f"| {r['alert_number']} | `{r['rule_id']}` | {r['severity'] or ''} | `{r['path']}` | **{r['ai_label']}** | {r['confidence']} | {'✔️' if r['dismissed'] else ''} |")
           if SUMMARY_PATH:
-            with open(SUMMARY_PATH, "a", encoding="utf-8") as f:
-              f.write("\n".join(md) + "\n")
+            with open(SUMMARY_PATH, "a", encoding="utf-8") as f: f.write("\n".join(md) + "\n")
 
           with open("cursor-ai-triage.json","w",encoding="utf-8") as f:
             json.dump(triaged, f, indent=2)
