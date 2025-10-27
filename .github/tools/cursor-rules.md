@@ -1,13 +1,14 @@
 # Cursor Rule: CodeQL triage policy
 
-- Always reason with attached files first; never guess.
-- Prefer "UNCERTAIN" when proof is insufficient.
+- Always reason from the attached files; do not guess.
+- Prefer "UNCERTAIN" if there is not enough proof to conclude TP or FP.
 - Return EXACTLY one JSON object with:
-  classification: "TP" | "FP" | "UNCERTAIN"
-  certainty: 0–100
-  rationale: <= 800 chars, reference exact lines/file names
-  evidence: [{path, lines?, reason}]
-  reproduce_steps: steps or null
-  fix_suggestion: concise fix
-- Treat sanitizer patterns (e.g., validation, encoding, parameterized queries) as FP if they fully cover dataflow.
-- Cite code by file and line range; no generalities.
+  - classification: "TP" | "FP" | "UNCERTAIN"
+  - certainty: 0–100
+  - rationale: ≤ 800 chars; reference exact files/lines
+  - evidence: array of { path, lines?, reason }
+  - reproduce_steps: steps or null
+  - fix_suggestion: concise fix
+- Treat sanitizer patterns (validation, encoding, parameterized queries, strict allowlists) as FP if they fully cover the dataflow into the sink.
+- If you claim TP, cite the **exact source → transformations → sink** with files and line ranges.
+- If you claim FP, cite the guard/sanitizer/dead-code reasoning with files and line ranges.
