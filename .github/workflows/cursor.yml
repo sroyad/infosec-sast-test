@@ -20,7 +20,7 @@ jobs:
 
       # Cursor
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-      CURSOR_MODEL: "claude-3-7-sonnet"      # used if your CLI supports a model flag
+      CURSOR_MODEL: "auto"      # used if your CLI supports a model flag
       CURSOR_RULES: ".github/tools/cursor-rules.md"
 
       # Triage knobs
