@@ -1,0 +1,485 @@
+name: "Debug Repo-Aware CodeQL AI Triage (proof & debug)"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  build-context-pack:
+    name: Build Context Pack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install regex tqdm
+
+      - name: Generate repo context (summary + file cards)
+        shell: bash
+        run: |
+          python - << 'PY'
+          import os, re, json, pathlib
+          from tqdm import tqdm
+
+          ROOT = pathlib.Path(".")
+          OUT  = pathlib.Path("context"); OUT.mkdir(parents=True, exist_ok=True)
+
+          CODE_EXTS = {".js",".ts",".jsx",".tsx",".py",".java",".kt",".go",".rb",".php",".cs",".scala",".rs",".c",".cpp"}
+          IGNORE_SEG = {"node_modules","vendor","dist","build","coverage","__tests__","tests","test",".git",".github",".next",".cache"}
+
+          def want(p: pathlib.Path)->bool:
+            return p.is_file() and p.suffix.lower() in CODE_EXTS and \
+              not any(seg in IGNORE_SEG for seg in p.parts) and p.stat().st_size <= 300_000
+
+          def read_text(p: pathlib.Path)->str:
+            try: return p.read_text(encoding="utf-8", errors="ignore")
+            except: return ""
+
+          files = [p for p in ROOT.rglob("*") if want(p)]
+          all_code = "\n".join(read_text(p) for p in files[:5000])
+
+          def has(pat): return re.search(pat, all_code, re.I) is not None
+
+          auth_model = "unknown"
+          if has(r'\bAuthorization\b') or has(r'\breq\.headers\.authorization\b'): auth_model = "header-jwt"
+          if has(r'cookie') and has(r'jwt'): auth_model = "cookie-jwt"
+          if has(r'session|express-session|flask\.session|django\.contrib\.sessions'): auth_model = "session-cookie"
+
+          frameworks=[]
+          for name,sig in[("express",r'\brequire\([\'"]express[\'"]\)|from\s+["\']express["\']'),
+                          ("fastapi",r'\bFastAPI\('),("flask",r'\bfrom\s+flask\s+import\b|\bFlask\('),
+                          ("spring",r'org\.springframework'),("django",r'\bdjango\.'),("rails",r'\brails\b'),
+                          ("gin",r'\bgithub\.com/gin-gonic/gin')]:
+            if has(sig): frameworks.append(name)
+
+          protections={"csrf":"present" if has(r'csrf|Csrf') else "unknown",
+                       "cors":"present" if has(r'\bcors\b') else "unknown",
+                       "xss_sanitize":"present" if has(r'sanitize|dompurify|bleach|html\.escape|xss') else "unknown",
+                       "ssrf_controls":"present" if has(r'allowlist|whitelist|http(s)?\.Agent|proxy') else "unknown"}
+
+          (OUT/"repo_summary.json").write_text(
+            json.dumps({"auth_model":auth_model,"frameworks":sorted(set(frameworks)),
+                        "protections":protections,"notes":"Heuristic POC"},indent=2),
+            encoding="utf-8"
+          )
+
+          def endpoints(txt,suffix):
+            out=[]
+            if suffix in (".js",".ts",".jsx",".tsx"):
+              for m in re.finditer(r'\b(app|router)\.(get|post|put|patch|delete)\(\s*["\']([^"\']+)',txt,re.I):
+                out.append({"path":m.group(3),"method":m.group(2).upper()})
+            if suffix==".py":
+              for m in re.finditer(r'@(app|router)\.(get|post|put|patch|delete)\(\s*["\']([^"\']+)',txt,re.I):
+                out.append({"path":m.group(3),"method":m.group(2).upper()})
+              for m in re.finditer(r'@app\.route\(\s*["\']([^"\']+).*methods=\[([^\]]+)\]',txt,re.I):
+                for mm in [s.strip(" '\"").upper() for s in m.group(2).split(",")]:
+                  out.append({"path":m.group(1),"method":mm})
+            return out[:12]
+
+          def imports(txt,suffix):
+            imps=[]
+            if suffix in (".js",".ts",".jsx",".tsx"):
+              imps+=[m.group(1) for m in re.finditer(r'from\s+["\']([^"\']+)["\']',txt)]
+              imps+=[m.group(1) for m in re.finditer(r'require\(\s*["\']([^"\']+)["\']\s*\)',txt)]
+            elif suffix==".py":
+              imps+=[m.group(1) for m in re.finditer(r'^\s*from\s+([a-zA-Z0-9_\.]+)\s+import',txt,re.M)]
+              imps+=[m.group(1) for m in re.finditer(r'^\s*import\s+([a-zA-Z0-9_\.]+)',txt,re.M)]
+            return list(dict.fromkeys(imps))[:30]
+
+          def sinks_sources(txt):
+            s,t=set(),set()
+            for kw in ["exec(","spawn(","child_process","Runtime.getRuntime()","subprocess","ProcessBuilder","os.system","popen"]:
+              if kw in txt: s.add("command_exec")
+            for kw in ["SELECT ","insert(","update(",".where(","execute(","cursor.execute(","ORM","Session("]:
+              if kw.lower() in txt.lower(): s.add("db")
+            for kw in ["render(","template","Jinja2","Handlebars","ejs","mustache"]:
+              if kw.lower() in txt.lower(): s.add("template_render")
+            for kw in ["req.body","req.query","req.params","request.form","request.args","request.json","ctx.Query","ctx.PostForm"]:
+              if kw in txt: t.add("user_input")
+            return sorted(s)[:12], sorted(t)[:12]
+
+          def sanitizers_validators(txt):
+            san,val=set(),set()
+            for kw in ["sanitize","escape","dompurify","bleach","html.escape","strip_tags","encode"]:
+              if re.search(r'\b'+re.escape(kw)+r'\b',txt,re.I): san.add(kw)
+            for kw in ["zod","joi","ajv","pydantic","marshmallow","validator","class-validator"]:
+              if re.search(r'\b'+re.escape(kw)+r'\b',txt,re.I): val.add(kw)
+            return sorted(san)[:12], sorted(val)[:12]
+
+          with (OUT/"file_cards.jsonl").open("w",encoding="utf-8") as f:
+            for p in tqdm(files,desc="cards"):
+              txt=read_text(p); suf=p.suffix.lower()
+              eps=endpoints(txt,suf); imps=imports(txt,suf)
+              sk,src=sinks_sources(txt); san,val=sanitizers_validators(txt)
+              bits=[]
+              if eps: bits.append(f"{len(eps)} endpoints")
+              if "Authorization" in txt: bits.append("reads Authorization header")
+              if "cookie" in txt.lower(): bits.append("reads cookies")
+              if san: bits.append("sanitizers present")
+              if val: bits.append("validators present")
+              summary="; ".join(bits) or "general module"
+              f.write(json.dumps({"path":p.as_posix(),"language":suf.lstrip("."),
+                                  "summary":summary,"endpoints":eps,"imports":imps,
+                                  "sinks":sk,"sources":src,"sanitizers":san,"validators":val},ensure_ascii=False)+"\n")
+          print("Context pack built.")
+          PY
+
+      - name: Upload context-pack
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-pack
+          path: context/
+          if-no-files-found: error
+
+  ai-triage:
+    name: AI Triage (repo-aware)
+    runs-on: ubuntu-latest
+    needs: [build-context-pack]
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO:  ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      DEVSAI_API_KEY: ${{ secrets.DEVSAI_API_KEY }}
+      DEVSAI_AI_ID:   "5c59c0bf-b78b-4c74-9787-e0bae6225bd5"
+      DEVSAI_BASE_URL: "https://devs.ai"
+      ALERT_STATE: "open"
+      MAX_ALERTS: "200"
+      AUTO_DISMISS: "false"
+      DISMISS_REASON: "false positive"
+      SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: context-pack
+          path: context
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install requests pexpect
+
+      - name: Ensure devs.py is present
+        run: |
+          test -f .github/tools/devs.py || { echo "::error::devs.py missing at .github/tools/devs.py"; exit 1; }
+
+      - name: Configure devs.ai CLI (headless)
+        run: |
+          mkdir -p "$HOME/.devscli"
+          cat > "$HOME/.devscli/config.json" <<JSON
+          {"api_key":"${DEVSAI_API_KEY}","selected_ai_id":"${DEVSAI_AI_ID}","base_url":"${DEVSAI_BASE_URL}"}
+          JSON
+
+      - name: Repo-aware triage
+        shell: bash
+        run: |
+          python - << 'PY'
+          import os, json, base64, re, textwrap, requests, pexpect, pathlib, random, string
+
+          OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]
+          GH=os.environ["GITHUB_TOKEN"]
+          ALERT_STATE=os.getenv("ALERT_STATE","open")
+          MAX_ALERTS=int(os.getenv("MAX_ALERTS","200"))
+          AUTO_DISMISS=os.getenv("AUTO_DISMISS","false").lower()=="true"
+          DISMISS_REASON=os.getenv("DISMISS_REASON","false positive")
+          SAFE_HINTS=[s.strip().lower() for s in os.getenv("SAFE_PATH_HINTS","").split(",") if s.strip()]
+          SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
+          DEVSPY=".github/tools/devs.py"
+
+          def nonce(n=10): return "".join(random.choices(string.ascii_lowercase+string.digits,k=n))
+
+          # load context
+          repo_summary = json.load(open("context/repo_summary.json","r",encoding="utf-8"))
+          file_cards = [json.loads(l) for l in open("context/file_cards.jsonl","r",encoding="utf-8") if l.strip()]
+          by_path = {c["path"]: c for c in file_cards}
+
+          sess=requests.Session()
+          sess.headers.update({"Authorization": f"Bearer {GH}", "Accept":"application/vnd.github+json"})
+
+          def list_alerts(state, page, per_page):
+            url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
+            r=sess.get(url, params={"state":state, "page":page, "per_page":per_page, "sort":"created","direction":"desc"}, timeout=60)
+            r.raise_for_status(); return r.json()
+
+          def get_file_snippet(path, ref_sha, start, end, ctx=10):
+            if not path: return ""
+            url=f"https://api.github.com/repos/{OWNER}/{REPO}/contents/{path}"
+            r=sess.get(url, params={"ref":ref_sha or "HEAD"}, timeout=60)
+            if r.status_code!=200: return ""
+            j=r.json()
+            content=base64.b64decode(j.get("content","")).decode("utf-8","ignore")
+            lines=content.splitlines()
+            s=max(1,(start or 1)-ctx); e=min(len(lines),(end or start or 1)+ctx)
+            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(s-1,e))
+
+          SEC_KEYWORDS=set("render escape encode sanitize template csrf cors jwt cookie header auth session sql query orm exec spawn subprocess popen file upload s3 http axios fetch request urllib xml deserialize serialize pickle jackson gson yaml load proxy dns socket".split())
+          def kw_score(card):
+            text=" ".join([card.get("summary","")] + card.get("imports",[]) + card.get("sinks",[]) + card.get("sources",[])).lower()
+            return sum(1 for k in SEC_KEYWORDS if k in text)
+
+          def related_cards(main_path, alert_msg, code_slice, k=5):
+            cand=[]
+            c=by_path.get(main_path); 
+            if c: cand.append(c)
+            prefix=str(pathlib.Path(main_path).parent).rstrip("/")
+            if prefix and prefix!=".":
+              neigh=[fc for fc in file_cards if fc["path"].startswith(prefix+"/")]
+              neigh=sorted(neigh,key=lambda x:-kw_score(x))
+              cand.extend(neigh[:2])
+            ranked=sorted(file_cards,key=lambda x:-kw_score(x))
+            for r in ranked[:5]:
+              if r not in cand: cand.append(r)
+            seen=set(); out=[]
+            for x in cand:
+              p=x["path"]
+              if p in seen: continue
+              seen.add(p); out.append(x)
+              if len(out)>=k: break
+            return out
+
+          def prompt_for_alert(a, snippet, bundle_cards, nonce_value):
+            rule=a.get("rule",{}) or {}
+            tool=(a.get("tool") or {}).get("name","")
+            rule_id=rule.get("id",""); rule_name=rule.get("name","")
+            sev=(a.get("rule_severity") or a.get("severity") or "")
+            inst=a.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
+            msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
+
+            cards_block="\n".join([json.dumps({"path":c["path"],"summary":c.get("summary",""),
+                                               "endpoints":c.get("endpoints",[]),
+                                               "sanitizers":c.get("sanitizers",[]),
+                                               "validators":c.get("validators",[]),
+                                               "imports":c.get("imports",[]),
+                                               "sinks":c.get("sinks",[]),
+                                               "sources":c.get("sources",[])},ensure_ascii=False)
+                                   for c in bundle_cards])
+
+            example={"classification":"TP","certainty":92,"rationale":"Example only.",
+                     "evidence":[{"path":"example/path.js","lines":"10-20","reason":"demo"}],
+                     "reproduce_steps":"curl …","fix_suggestion":"Add validator",
+                     "nonce_echo":"abc123","used_cards":["example/path.js"]}
+
+            return textwrap.dedent(f"""
+            You are triaging a CodeQL alert using whole-repo context.
+
+            Return ONLY a single JSON object with fields:
+            - classification: "TP" | "FP" | "UNCERTAIN"
+            - certainty: integer 0-100
+            - rationale: short text
+            - evidence: array of objects {{ "path": "...", "lines": "optional", "reason": "..." }}
+            - reproduce_steps: short text or null
+            - fix_suggestion: short text
+            - nonce_echo: MUST equal "{nonce_value}"
+            - used_cards: array of file paths you relied on from the Context cards
+
+            Example output (structure only):
+            ```json
+            {json.dumps(example, ensure_ascii=False)}
+            ```
+
+            Global repo summary:
+            {json.dumps(repo_summary, ensure_ascii=False)}
+
+            Context cards (subset of repo):
+            {cards_block}
+
+            Alert:
+            - tool: {tool or 'CodeQL'}
+            - ruleId: {rule_id}
+            - ruleName: {rule_name}
+            - severity: {sev}
+            - file: {path}:{start}
+            - message: {msg}
+
+            Code slice (±10 lines):
+            ```
+            {snippet}
+            ```
+            """)
+
+          def call_devs(prompt:str)->str:
+            child=pexpect.spawn("python3",[DEVSPY],encoding="utf-8",timeout=240)
+            try: child.expect(r'Chat started',timeout=60)
+            except Exception: pass
+            child.sendline(prompt)
+            buf=[]
+            while True:
+              try: line=child.readline()
+              except Exception: break
+              if not line: break
+              if line.strip().startswith("> "): break
+              buf.append(line)
+            try:
+              child.sendline("/exit"); child.expect(pexpect.EOF,timeout=5)
+            except Exception: pass
+            return "".join(buf).strip()
+
+          FENCED_JSON_RX=re.compile(r"```json\s*(\{.*?\})\s*```",re.S|re.I)
+          def first_json(text:str):
+            if not text: return None
+            m=FENCED_JSON_RX.search(text)
+            if m:
+              try: return json.loads(m.group(1))
+              except Exception: pass
+            opens=[i for i,ch in enumerate(text) if ch=="{"]
+            for start in opens:
+              depth=0; in_str=False; esc=False
+              for i in range(start,len(text)):
+                ch=text[i]
+                if in_str:
+                  if esc: esc=False
+                  elif ch=="\\": esc=True
+                  elif ch=='"': in_str=False
+                else:
+                  if ch=='"': in_str=True
+                  elif ch=='{': depth+=1
+                  elif ch=='}':
+                    depth-=1
+                    if depth==0:
+                      try: return json.loads(text[start:i+1])
+                      except Exception: break
+            return None
+
+          VERDICT_RX=re.compile(r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b',re.I|re.M)
+          def map_old(tok):
+            t=tok.upper().strip(); likely=t.startswith("LIKELY "); base=t.replace("LIKELY ","")
+            if base=="REAL_ISSUE": return ("TP",90 if not likely else 75)
+            if base=="FALSE_POSITIVE": return ("FP",90 if not likely else 75)
+            return ("UNCERTAIN",50)
+
+          def parse_reply(text:str, expected_nonce:str, bundle_paths:set):
+            obj=first_json(text)
+            if obj is None:
+              for m in VERDICT_RX.finditer(text or ""):
+                c,cert=map_old(m.group(1))
+                return {"classification":c,"certainty":cert,"rationale":"(legacy verdict)","evidence":[],
+                        "reproduce_steps":None,"fix_suggestion":"","nonce_echo":"","used_cards":[],"_valid_nonce":False,"_cards_ok":False}
+              return {"classification":"UNCERTAIN","certainty":50,"rationale":"no JSON","evidence":[],
+                      "reproduce_steps":None,"fix_suggestion":"","nonce_echo":"","used_cards":[],"_valid_nonce":False,"_cards_ok":False}
+            # validations
+            valid_nonce = obj.get("nonce_echo")==expected_nonce
+            used = obj.get("used_cards") or []
+            cards_ok = bool(used) and all(u in bundle_paths for u in used)
+            obj["_valid_nonce"]=valid_nonce; obj["_cards_ok"]=cards_ok
+            return obj
+
+          def safe_path(p:str)->bool:
+            p=(p or "").lower()
+            return any(h in p for h in SAFE_HINTS)
+
+          # fetch alerts
+          alerts=[]; page=1
+          while len(alerts)<MAX_ALERTS:
+            batch=list_alerts(ALERT_STATE,page,min(100,MAX_ALERTS-len(alerts)))
+            if not batch: break
+            alerts.extend(batch); page+=1
+          alerts=[a for a in alerts if (a.get("tool") or {}).get("name","").lower()=="codeql"]
+
+          pathlib.Path("triage-debug").mkdir(exist_ok=True)
+          triaged=[]
+
+          for a in alerts:
+            inst=a.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path") or ""; start=loc.get("start_line") or 1; end=loc.get("end_line") or start
+            ref_sha=inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or "HEAD"
+            snippet=get_file_snippet(path,ref_sha,start,end)
+            bundle=related_cards(path,(inst.get("message") or {}).get("text",""),snippet,k=5)
+            bundle_paths=set([c["path"] for c in bundle])
+            nonce_val=nonce()
+            prompt=prompt_for_alert(a,snippet,bundle,nonce_val)
+
+            raw=call_devs(prompt)
+            verdict=parse_reply(raw, nonce_val, bundle_paths)
+
+            classification=str(verdict.get("classification","UNCERTAIN")).upper()
+            certainty=int(verdict.get("certainty",50))
+            rationale=(verdict.get("rationale") or "")[:1000]
+            nonce_ok=verdict.get("_valid_nonce",False)
+            cards_ok=verdict.get("_cards_ok",False)
+
+            # debug bundle
+            dbg={
+              "alert_number":a.get("number"),
+              "rule_id":(a.get("rule") or {}).get("id"),
+              "path":path,"nonce":nonce_val,
+              "bundle_paths":list(bundle_paths),
+              "prompt":prompt,
+              "raw_reply":raw,
+              "parsed":verdict
+            }
+            open(f"triage-debug/alert-{a.get('number')}.json","w",encoding="utf-8").write(json.dumps(dbg,indent=2))
+
+            rec={
+              "alert_number":a.get("number"),
+              "rule_id":(a.get("rule") or {}).get("id"),
+              "severity":a.get("rule_severity") or a.get("severity"),
+              "path":path,
+              "classification":classification,
+              "certainty":certainty,
+              "rationale":rationale,
+              "nonce_ok":nonce_ok,
+              "cards_ok":cards_ok,
+              "dismissed":False
+            }
+
+            # only allow auto-dismiss if proof is valid
+            if AUTO_DISMISS and classification=="FP" and certainty>=90 and nonce_ok and cards_ok and safe_path(path):
+              url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
+              r=sess.patch(url,json={"state":"dismissed","dismissed_reason":DISMISS_REASON},timeout=60)
+              rec["dismissed"]=r.status_code in (200,201)
+
+            triaged.append(rec)
+
+          lines=[
+            "Repo-aware triage complete (with proof).",
+            f"Reviewed: {len(triaged)} | Auto-dismiss: {'ON' if AUTO_DISMISS else 'OFF'}",
+            "",
+            "| # | Rule | Path | Class | Cert | Nonce | Cards | Dismissed |",
+            "|--:|---|---|:---:|:--:|:--:|:--:|:--:|",
+          ]
+          for r in triaged:
+            lines.append(f"| {r['alert_number']} | `{r['rule_id']}` | `{r['path']}` | **{r['classification']}** | {r['certainty']} | {'✔️' if r['nonce_ok'] else '❌'} | {'✔️' if r['cards_ok'] else '❌'} | {'✔️' if r['dismissed'] else ''} |")
+
+          if SUMMARY_PATH:
+            open(SUMMARY_PATH,"a",encoding="utf-8").write("\n".join(lines)+"\n")
+
+          open("repo-aware-triage.json","w",encoding="utf-8").write(json.dumps(triaged,indent=2))
+          PY
+
+      - name: Upload triage JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-aware-triage
+          path: repo-aware-triage.json
+          if-no-files-found: error
+
+      - name: Upload triage debug bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-debug
+          path: triage-debug/
+          if-no-files-found: error
