@@ -1,9 +1,9 @@
-name: "Debug Repo-Aware CodeQL AI Triage (proof & debug)"
+name: "Debug Repo-Aware CodeQL AI Triage (marker JSON, proof & debug)"
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "17 3 * * 1"  # Mondays 03:17 UTC
 
 permissions:
   contents: read
@@ -15,12 +15,10 @@ jobs:
     name: Build Context Pack
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with: { fetch-depth: 0 }
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -43,8 +41,11 @@ jobs:
           IGNORE_SEG = {"node_modules","vendor","dist","build","coverage","__tests__","tests","test",".git",".github",".next",".cache"}
 
           def want(p: pathlib.Path)->bool:
-            return p.is_file() and p.suffix.lower() in CODE_EXTS and \
-              not any(seg in IGNORE_SEG for seg in p.parts) and p.stat().st_size <= 300_000
+            try:
+              return p.is_file() and p.suffix.lower() in CODE_EXTS and \
+                     not any(seg in IGNORE_SEG for seg in p.parts) and p.stat().st_size <= 300_000
+            except Exception:
+              return False
 
           def read_text(p: pathlib.Path)->str:
             try: return p.read_text(encoding="utf-8", errors="ignore")
@@ -61,20 +62,31 @@ jobs:
           if has(r'session|express-session|flask\.session|django\.contrib\.sessions'): auth_model = "session-cookie"
 
           frameworks=[]
-          for name,sig in[("express",r'\brequire\([\'"]express[\'"]\)|from\s+["\']express["\']'),
-                          ("fastapi",r'\bFastAPI\('),("flask",r'\bfrom\s+flask\s+import\b|\bFlask\('),
-                          ("spring",r'org\.springframework'),("django",r'\bdjango\.'),("rails",r'\brails\b'),
-                          ("gin",r'\bgithub\.com/gin-gonic/gin')]:
+          for name,sig in[
+            ("express", r'\brequire\([\'"]express[\'"]\)|from\s+["\']express["\']'),
+            ("fastapi", r'\bFastAPI\('),
+            ("flask",   r'\bfrom\s+flask\s+import\b|\bFlask\('),
+            ("spring",  r'org\.springframework'),
+            ("django",  r'\bdjango\.'),
+            ("rails",   r'\brails\b'),
+            ("gin",     r'\bgithub\.com/gin-gonic/gin')
+          ]:
             if has(sig): frameworks.append(name)
 
-          protections={"csrf":"present" if has(r'csrf|Csrf') else "unknown",
-                       "cors":"present" if has(r'\bcors\b') else "unknown",
-                       "xss_sanitize":"present" if has(r'sanitize|dompurify|bleach|html\.escape|xss') else "unknown",
-                       "ssrf_controls":"present" if has(r'allowlist|whitelist|http(s)?\.Agent|proxy') else "unknown"}
+          protections = {
+            "csrf": "present" if has(r'csrf|Csrf') else "unknown",
+            "cors": "present" if has(r'\bcors\b') else "unknown",
+            "xss_sanitize": "present" if has(r'sanitize|dompurify|bleach|html\.escape|xss') else "unknown",
+            "ssrf_controls": "present" if has(r'allowlist|whitelist|http(s)?\.Agent|proxy') else "unknown",
+          }
 
           (OUT/"repo_summary.json").write_text(
-            json.dumps({"auth_model":auth_model,"frameworks":sorted(set(frameworks)),
-                        "protections":protections,"notes":"Heuristic POC"},indent=2),
+            json.dumps({
+              "auth_model":auth_model,
+              "frameworks":sorted(set(frameworks)),
+              "protections":protections,
+              "notes":"Heuristic POC"
+            }, indent=2),
             encoding="utf-8"
           )
 
@@ -133,14 +145,15 @@ jobs:
               if san: bits.append("sanitizers present")
               if val: bits.append("validators present")
               summary="; ".join(bits) or "general module"
-              f.write(json.dumps({"path":p.as_posix(),"language":suf.lstrip("."),
-                                  "summary":summary,"endpoints":eps,"imports":imps,
-                                  "sinks":sk,"sources":src,"sanitizers":san,"validators":val},ensure_ascii=False)+"\n")
+              f.write(json.dumps({
+                "path":p.as_posix(),"language":suf.lstrip("."),
+                "summary":summary,"endpoints":eps,"imports":imps,
+                "sinks":sk,"sources":src,"sanitizers":san,"validators":val
+              },ensure_ascii=False)+"\n")
           print("Context pack built.")
           PY
 
-      - name: Upload context-pack
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: context-pack
           path: context/
@@ -169,6 +182,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: context-pack
+        # downloads into ./context by default in this action version
           path: context
 
       - uses: actions/setup-python@v5
@@ -207,7 +221,6 @@ jobs:
 
           def nonce(n=10): return "".join(random.choices(string.ascii_lowercase+string.digits,k=n))
 
-          # load context
           repo_summary = json.load(open("context/repo_summary.json","r",encoding="utf-8"))
           file_cards = [json.loads(l) for l in open("context/file_cards.jsonl","r",encoding="utf-8") if l.strip()]
           by_path = {c["path"]: c for c in file_cards}
@@ -232,29 +245,31 @@ jobs:
             return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(s-1,e))
 
           SEC_KEYWORDS=set("render escape encode sanitize template csrf cors jwt cookie header auth session sql query orm exec spawn subprocess popen file upload s3 http axios fetch request urllib xml deserialize serialize pickle jackson gson yaml load proxy dns socket".split())
-          def kw_score(card):
-            text=" ".join([card.get("summary","")] + card.get("imports",[]) + card.get("sinks",[]) + card.get("sources",[])).lower()
+          def card_score(c):
+            text=" ".join([c.get("summary","")] + c.get("imports",[]) + c.get("sinks",[]) + c.get("sources",[])).lower()
             return sum(1 for k in SEC_KEYWORDS if k in text)
 
-          def related_cards(main_path, alert_msg, code_slice, k=5):
+          def related_cards(main_path, k=2):
+            # keep it tight to avoid token blowups
             cand=[]
             c=by_path.get(main_path); 
             if c: cand.append(c)
             prefix=str(pathlib.Path(main_path).parent).rstrip("/")
             if prefix and prefix!=".":
               neigh=[fc for fc in file_cards if fc["path"].startswith(prefix+"/")]
-              neigh=sorted(neigh,key=lambda x:-kw_score(x))
-              cand.extend(neigh[:2])
-            ranked=sorted(file_cards,key=lambda x:-kw_score(x))
-            for r in ranked[:5]:
-              if r not in cand: cand.append(r)
-            seen=set(); out=[]
-            for x in cand:
-              p=x["path"]
-              if p in seen: continue
-              seen.add(p); out.append(x)
-              if len(out)>=k: break
-            return out
+              neigh=sorted(neigh,key=lambda x:-card_score(x))
+              for n in neigh:
+                if n["path"]!=main_path:
+                  cand.append(n); break
+            if len(cand)<k:
+              pool=sorted(file_cards,key=lambda x:-card_score(x))
+              for r in pool:
+                if r not in cand:
+                  cand.append(r)
+                if len(cand)>=k: break
+            return cand[:k]
+
+          START, END = "<<<JSON", ">>>"
 
           def prompt_for_alert(a, snippet, bundle_cards, nonce_value):
             rule=a.get("rule",{}) or {}
@@ -266,37 +281,28 @@ jobs:
             path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
             msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
 
-            cards_block="\n".join([json.dumps({"path":c["path"],"summary":c.get("summary",""),
-                                               "endpoints":c.get("endpoints",[]),
-                                               "sanitizers":c.get("sanitizers",[]),
-                                               "validators":c.get("validators",[]),
-                                               "imports":c.get("imports",[]),
-                                               "sinks":c.get("sinks",[]),
-                                               "sources":c.get("sources",[])},ensure_ascii=False)
-                                   for c in bundle_cards])
-
-            example={"classification":"TP","certainty":92,"rationale":"Example only.",
-                     "evidence":[{"path":"example/path.js","lines":"10-20","reason":"demo"}],
-                     "reproduce_steps":"curl …","fix_suggestion":"Add validator",
-                     "nonce_echo":"abc123","used_cards":["example/path.js"]}
+            cards_block="\n".join([json.dumps({
+              "path":c["path"],"summary":c.get("summary",""),
+              "endpoints":c.get("endpoints",[]),"sanitizers":c.get("sanitizers",[]),
+              "validators":c.get("validators",[]),"imports":c.get("imports",[]),
+              "sinks":c.get("sinks",[]),"sources":c.get("sources",[])
+            },ensure_ascii=False) for c in bundle_cards])
 
             return textwrap.dedent(f"""
             You are triaging a CodeQL alert using whole-repo context.
 
-            Return ONLY a single JSON object with fields:
-            - classification: "TP" | "FP" | "UNCERTAIN"
-            - certainty: integer 0-100
-            - rationale: short text
-            - evidence: array of objects {{ "path": "...", "lines": "optional", "reason": "..." }}
-            - reproduce_steps: short text or null
-            - fix_suggestion: short text
-            - nonce_echo: MUST equal "{nonce_value}"
-            - used_cards: array of file paths you relied on from the Context cards
-
-            Example output (structure only):
-            ```json
-            {json.dumps(example, ensure_ascii=False)}
-            ```
+            Output requirement:
+            - Return JSON ONLY, no prose, no code fences.
+            - Put your JSON between the markers {START} and {END} on their own lines.
+            - JSON fields REQUIRED:
+              classification: "TP" | "FP" | "UNCERTAIN"
+              certainty: integer 0-100
+              rationale: short text
+              evidence: array of objects {{ "path": "...", "lines": "optional", "reason": "..." }}
+              reproduce_steps: short text or null
+              fix_suggestion: short text
+              nonce_echo: MUST equal "{nonce_value}"
+              used_cards: array of file paths you relied on from the Context cards
 
             Global repo summary:
             {json.dumps(repo_summary, ensure_ascii=False)}
@@ -316,6 +322,11 @@ jobs:
             ```
             {snippet}
             ```
+
+            Respond with:
+            {START}
+            {{YOUR_JSON_ONLY}}
+            {END}
             """)
 
           def call_devs(prompt:str)->str:
@@ -330,65 +341,45 @@ jobs:
               if not line: break
               if line.strip().startswith("> "): break
               buf.append(line)
-            try:
-              child.sendline("/exit"); child.expect(pexpect.EOF,timeout=5)
+            try: child.sendline("/exit"); child.expect(pexpect.EOF,timeout=5)
             except Exception: pass
-            return "".join(buf).strip()
+            return "".join(buf)
 
-          FENCED_JSON_RX=re.compile(r"```json\s*(\{.*?\})\s*```",re.S|re.I)
-          def first_json(text:str):
-            if not text: return None
-            m=FENCED_JSON_RX.search(text)
-            if m:
-              try: return json.loads(m.group(1))
-              except Exception: pass
-            opens=[i for i,ch in enumerate(text) if ch=="{"]
-            for start in opens:
-              depth=0; in_str=False; esc=False
-              for i in range(start,len(text)):
-                ch=text[i]
-                if in_str:
-                  if esc: esc=False
-                  elif ch=="\\": esc=True
-                  elif ch=='"': in_str=False
-                else:
-                  if ch=='"': in_str=True
-                  elif ch=='{': depth+=1
-                  elif ch=='}':
-                    depth-=1
-                    if depth==0:
-                      try: return json.loads(text[start:i+1])
-                      except Exception: break
-            return None
-
-          VERDICT_RX=re.compile(r'^\s*(?:Verdict|Decision|Assessment|Triage\s*decision)\s*:\s*((?:Likely\s+)?(?:REAL_ISSUE|FALSE_POSITIVE))\b',re.I|re.M)
-          def map_old(tok):
-            t=tok.upper().strip(); likely=t.startswith("LIKELY "); base=t.replace("LIKELY ","")
-            if base=="REAL_ISSUE": return ("TP",90 if not likely else 75)
-            if base=="FALSE_POSITIVE": return ("FP",90 if not likely else 75)
-            return ("UNCERTAIN",50)
-
-          def parse_reply(text:str, expected_nonce:str, bundle_paths:set):
-            obj=first_json(text)
-            if obj is None:
-              for m in VERDICT_RX.finditer(text or ""):
-                c,cert=map_old(m.group(1))
-                return {"classification":c,"certainty":cert,"rationale":"(legacy verdict)","evidence":[],
-                        "reproduce_steps":None,"fix_suggestion":"","nonce_echo":"","used_cards":[],"_valid_nonce":False,"_cards_ok":False}
-              return {"classification":"UNCERTAIN","certainty":50,"rationale":"no JSON","evidence":[],
-                      "reproduce_steps":None,"fix_suggestion":"","nonce_echo":"","used_cards":[],"_valid_nonce":False,"_cards_ok":False}
-            # validations
-            valid_nonce = obj.get("nonce_echo")==expected_nonce
-            used = obj.get("used_cards") or []
-            cards_ok = bool(used) and all(u in bundle_paths for u in used)
-            obj["_valid_nonce"]=valid_nonce; obj["_cards_ok"]=cards_ok
-            return obj
+          def extract_marked_json(text:str):
+            # Only accept content between <<<JSON and >>>
+            start_idx = text.rfind("<<<JSON")
+            end_idx   = text.rfind(">>>")
+            if start_idx == -1 or end_idx == -1 or end_idx < start_idx:
+              return None
+            payload = text[start_idx+7:end_idx].strip()
+            try:
+              return json.loads(payload)
+            except Exception:
+              # as a fallback, try simple brace-scan inside the payload
+              t=payload
+              opens=[i for i,ch in enumerate(t) if ch=="{"]
+              for s in opens:
+                depth=0; ins=False; esc=False
+                for i in range(s,len(t)):
+                  ch=t[i]
+                  if ins:
+                    if esc: esc=False
+                    elif ch=="\\": esc=True
+                    elif ch=='"': ins=False
+                  else:
+                    if ch=='"': ins=True
+                    elif ch=='{': depth+=1
+                    elif ch=='}':
+                      depth-=1
+                      if depth==0:
+                        try: return json.loads(t[s:i+1])
+                        except Exception: break
+              return None
 
           def safe_path(p:str)->bool:
             p=(p or "").lower()
             return any(h in p for h in SAFE_HINTS)
 
-          # fetch alerts
           alerts=[]; page=1
           while len(alerts)<MAX_ALERTS:
             batch=list_alerts(ALERT_STATE,page,min(100,MAX_ALERTS-len(alerts)))
@@ -405,29 +396,32 @@ jobs:
             path=loc.get("path") or ""; start=loc.get("start_line") or 1; end=loc.get("end_line") or start
             ref_sha=inst.get("commit_sha") or a.get("most_recent_analysis_commit_sha") or "HEAD"
             snippet=get_file_snippet(path,ref_sha,start,end)
-            bundle=related_cards(path,(inst.get("message") or {}).get("text",""),snippet,k=5)
-            bundle_paths=set([c["path"] for c in bundle])
-            nonce_val=nonce()
-            prompt=prompt_for_alert(a,snippet,bundle,nonce_val)
+            bundle=related_cards(path,k=2)
+            bundle_paths=set(c["path"] for c in bundle)
+            n=nonce()
+            prompt=prompt_for_alert(a,snippet,bundle,n)
 
             raw=call_devs(prompt)
-            verdict=parse_reply(raw, nonce_val, bundle_paths)
+            obj=extract_marked_json(raw)
 
-            classification=str(verdict.get("classification","UNCERTAIN")).upper()
-            certainty=int(verdict.get("certainty",50))
-            rationale=(verdict.get("rationale") or "")[:1000]
-            nonce_ok=verdict.get("_valid_nonce",False)
-            cards_ok=verdict.get("_cards_ok",False)
+            if obj is None:
+              classification="UNCERTAIN"; certainty=50; rationale="Model did not return marked JSON"; nonce_ok=False; cards_ok=False
+            else:
+              classification=str(obj.get("classification","UNCERTAIN")).upper()
+              certainty=int(obj.get("certainty",50))
+              rationale=(obj.get("rationale") or "")[:1000]
+              nonce_ok = (obj.get("nonce_echo")==n)
+              used = obj.get("used_cards") or []
+              cards_ok = bool(used) and all(u in bundle_paths for u in used)
 
-            # debug bundle
             dbg={
               "alert_number":a.get("number"),
               "rule_id":(a.get("rule") or {}).get("id"),
-              "path":path,"nonce":nonce_val,
+              "path":path,"nonce":n,
               "bundle_paths":list(bundle_paths),
               "prompt":prompt,
               "raw_reply":raw,
-              "parsed":verdict
+              "parsed":obj if obj is not None else {"_error":"no marked json"}
             }
             open(f"triage-debug/alert-{a.get('number')}.json","w",encoding="utf-8").write(json.dumps(dbg,indent=2))
 
@@ -444,7 +438,6 @@ jobs:
               "dismissed":False
             }
 
-            # only allow auto-dismiss if proof is valid
             if AUTO_DISMISS and classification=="FP" and certainty>=90 and nonce_ok and cards_ok and safe_path(path):
               url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
               r=sess.patch(url,json={"state":"dismissed","dismissed_reason":DISMISS_REASON},timeout=60)
@@ -453,7 +446,7 @@ jobs:
             triaged.append(rec)
 
           lines=[
-            "Repo-aware triage complete (with proof).",
+            "Repo-aware triage complete (with proof, marker JSON).",
             f"Reviewed: {len(triaged)} | Auto-dismiss: {'ON' if AUTO_DISMISS else 'OFF'}",
             "",
             "| # | Rule | Path | Class | Cert | Nonce | Cards | Dismissed |",
@@ -468,17 +461,15 @@ jobs:
           open("repo-aware-triage.json","w",encoding="utf-8").write(json.dumps(triaged,indent=2))
           PY
 
-      - name: Upload triage JSON
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: repo-aware-triage
           path: repo-aware-triage.json
           if-no-files-found: error
 
-      - name: Upload triage debug bundle
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: triage-debug
           path: triage-debug/
