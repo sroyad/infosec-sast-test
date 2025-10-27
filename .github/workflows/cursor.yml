@@ -1,4 +1,4 @@
-name: "Cursor AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
+name: "AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
 
 on:
   workflow_dispatch:
@@ -20,8 +20,8 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Cursor
-      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}     # <-- create at org level
-      CURSOR_MODEL: "claude-3-7-sonnet"                 # or gpt-4.1 if you have it
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}   # <-- create at org level
+      CURSOR_MODEL: "claude-3-7-sonnet"               # or another long-context model
       CURSOR_RULES: ".github/tools/cursor-rules.md"
 
       # Triage knobs
@@ -44,23 +44,25 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install requests pexpect
 
-      - name: Setup Node 20 (for Cursor CLI via NPM)
+      - name: Setup Node 20 (some Cursor wrappers expect Node on PATH)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Cursor Agent CLI (NPM)
+      - name: Install Cursor Agent CLI (official)
         run: |
-          npm install -g @cursorai/cli
-          which cursor-agent || { echo "cursor-agent not on PATH"; exit 1; }
-          cursor-agent -v || echo "Cursor CLI version check succeeded"
+          set -euo pipefail
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+          which cursor-agent || { echo "cursor-agent not found on PATH"; exit 1; }
+          cursor-agent -v
 
       - name: Validate Cursor auth
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY not set"; exit 1; }
-          # Minimal ping
           cursor-agent -p -m "${CURSOR_MODEL}" -f <(echo ok) >/dev/null
 
       - name: Ensure rules file exists
@@ -74,7 +76,7 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           python3 - << 'PY'
-          import os, json, base64, re, textwrap, subprocess, tempfile, pathlib, requests
+          import os, json, re, textwrap, subprocess, tempfile, pathlib, requests
 
           OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]; GH=os.environ["GITHUB_TOKEN"]
           ALERT_STATE=os.getenv("ALERT_STATE","open")
@@ -113,8 +115,10 @@ jobs:
             return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
 
           def rg(pattern):
-            try: return run(["rg","-n","--no-messages",pattern,"."]).splitlines()
-            except subprocess.CalledProcessError: return []
+            try:
+              return run(["rg","-n","--no-messages",pattern,"."]).splitlines()
+            except subprocess.CalledProcessError:
+              return []
 
           def build_ctags():
             tags = {}
@@ -167,7 +171,7 @@ jobs:
 
             # neighbor hits by ripgrep
             for sym in symbol_candidates(snippet)[:15]:
-              for line in rg(rf'\\b{re.escape(sym)}\\b')[:50]:
+              for line in rg(rf'\b{re.escape(sym)}\b')[:50]:
                 f=line.split(":")[0]
                 if f.startswith("./"): f=f[2:]
                 if pathlib.Path(f).is_file():
@@ -262,7 +266,7 @@ jobs:
             ai_text = cursor_run(make_prompt(a, snippet), ctx_files)
 
             parsed=None
-            m = re.search(r'\\{.*\\}\\s*$', ai_text, flags=re.S)
+            m = re.search(r'\{.*\}\s*$', ai_text, flags=re.S)
             if m:
               try: parsed=json.loads(m.group(0))
               except Exception: pass
