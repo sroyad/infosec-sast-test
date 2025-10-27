@@ -1,0 +1,314 @@
+name: "AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  ai-triage-cursor:
+    name: AI Triage & Summary Existing Alerts
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO:  ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- Cursor CLI ---
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}   # org-level secret
+      CURSOR_MODEL: "claude-3-7-sonnet"               # or "gpt-4.1" etc.
+      CURSOR_RULES: ".github/tools/cursor-rules.md"   # required triage policy
+
+      # triage knobs
+      ALERT_STATE: "open"
+      MAX_ALERTS: "300"
+      AUTO_DISMISS: "false"
+      DISMISS_REASON: "false positive"
+      SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
+
+    steps:
+      - name: Checkout (for code context)
+        uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Install deps (ripgrep, universal-ctags, jq, Python pkgs)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ripgrep universal-ctags jq
+          python3 -m pip install --upgrade pip
+          python3 -m pip install requests pexpect
+
+      - name: Install Cursor Agent CLI
+        run: |
+          curl -fsSL https://cursor.com/cli/install.sh | bash
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+          cursor-agent -v || (echo "Cursor CLI missing"; exit 1)
+
+      - name: Validate Cursor auth
+        run: |
+          test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY not set"; exit 1; }
+          cursor-agent -p -m "$CURSOR_MODEL" -f "ok" > /dev/null
+
+      - name: Ensure triage rule exists
+        run: |
+          test -f "$CURSOR_RULES" || { echo "Missing $CURSOR_RULES"; exit 1; }
+          echo "Using Cursor Rules at $CURSOR_RULES"
+
+      - name: Triage existing Code Scanning alerts with Cursor
+        id: triage
+        run: |
+          python3 - << 'PY'
+          import os, json, base64, re, textwrap, subprocess, tempfile, pathlib, requests, shlex
+
+          OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]; GH=os.environ["GITHUB_TOKEN"]
+          ALERT_STATE=os.getenv("ALERT_STATE","open")
+          MAX_ALERTS=int(os.getenv("MAX_ALERTS","300"))
+          AUTO_DISMISS=os.getenv("AUTO_DISMISS","false").lower()=="true"
+          DISMISS_REASON=os.getenv("DISMISS_REASON","false positive")
+          SAFE_HINTS=[s.strip().lower() for s in os.getenv("SAFE_PATH_HINTS","").split(",") if s.strip()]
+          CURSOR_MODEL=os.getenv("CURSOR_MODEL","claude-3-7-sonnet")
+          CURSOR_RULES=os.getenv("CURSOR_RULES",".github/tools/cursor-rules.md")
+          SUMMARY_PATH=os.environ.get("GITHUB_STEP_SUMMARY")
+
+          repo_root = pathlib.Path(".").resolve()
+
+          sess=requests.Session()
+          sess.headers.update({"Authorization": f"Bearer {GH}", "Accept":"application/vnd.github+json"})
+
+          def list_alerts(state, page, per_page):
+            url=f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts"
+            r=sess.get(url, params={"state":state, "page":page, "per_page":per_page, "sort":"created","direction":"desc"}, timeout=60)
+            r.raise_for_status(); return r.json()
+
+          def read_file(path, ref_sha=None):
+            # Use local checkout (faster than Contents API) since we already checked out HEAD
+            p = repo_root / path
+            if not p.exists(): return None
+            try:
+              return p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+              return None
+
+          def lines_with_numbers(s, start, end, ctx=10):
+            lines = (s or "").splitlines()
+            if not lines: return ""
+            sidx = max(1,(start or 1)-ctx); eidx = min(len(lines),(end or start or 1)+ctx)
+            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(sidx-1,eidx))
+
+          def rg(pattern):
+            try:
+              out = subprocess.check_output(["rg","-n","--no-messages",pattern,"."], text=True)
+              return out.splitlines()
+            except subprocess.CalledProcessError:
+              return []
+
+          def ctags_defs():
+            tags = {}
+            try:
+              subprocess.check_call(["ctags","-R","--fields=+n","--languages=Python,TypeScript,JavaScript,Go,Java,PHP,Ruby,Swift,Scala,C,C++","-f",".tags"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              for line in pathlib.Path(".tags").read_text(errors="ignore").splitlines():
+                if line.startswith("!"): continue
+                parts = line.split("\t")
+                if len(parts) < 4: continue
+                sym, file = parts[0], parts[1]
+                tags.setdefault(sym, set()).add(file)
+            except Exception:
+              pass
+            return tags
+
+          TAGS = ctags_defs()
+
+          def symbol_candidates(snippet):
+            # crude heuristic: words that look like function/class/ident names
+            out=set()
+            for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", snippet or ""):
+              if tok in ("import","from","class","function","return","const","let","var","public","private","protected"): continue
+              if tok[0].isupper() or "_" in tok or len(tok) > 5:
+                out.add(tok)
+            return list(out)[:50]
+
+          def gather_context(path, start, end):
+            files = set()
+            files.add(path)
+
+            file_text = read_file(path)
+            snippet = lines_with_numbers(file_text, start, end, ctx=12)
+
+            # imports in the file
+            for l in (file_text or "").splitlines():
+              m = re.search(r'^\s*(?:import|from)\s+([A-Za-z0-9_./-]+)', l)
+              if m:
+                cand=m.group(1)
+                # try resolving relative imports quickly
+                for ext in ("",".py",".ts",".tsx",".js",".jsx"):
+                  p=(repo_root / pathlib.Path(path).parent / (cand+ext)).resolve()
+                  if p.exists() and p.is_file():
+                    files.add(str(p.relative_to(repo_root)))
+
+            # definitions of symbols in the snippet
+            for sym in symbol_candidates(snippet):
+              for f in TAGS.get(sym, []):
+                if pathlib.Path(f).exists():
+                  files.add(f)
+
+            # neighbors via ripgrep of symbol names
+            for sym in symbol_candidates(snippet)[:15]:
+              for line in rg(rf'\b{re.escape(sym)}\b')[:50]:
+                f=line.split(":")[0]
+                if f.startswith("./"): f=f[2:]
+                if pathlib.Path(f).is_file():
+                  files.add(f)
+
+            # de-noise
+            noisey=("node_modules/","vendor/","dist/","build/","coverage/","min.js")
+            files={f for f in files if not any(n in f for n in noisey)}
+            return snippet, sorted(files)
+
+          def safe_path(p: str) -> bool:
+            p = (p or "").lower()
+            return any(h in p for h in SAFE_HINTS)
+
+          def cursor_run(prompt_text, files):
+            # Write a temp file listing attachments and a temp prompt file
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as pf:
+              pf.write(prompt_text)
+              pf.flush()
+              # Attach files via multiple -a flags
+              args = ["cursor-agent","-p","-m",os.getenv("CURSOR_MODEL", "claude-3-7-sonnet"),
+                      "--rules", CURSOR_RULES,
+                      "--format","text",
+                      "--timeout","180"]
+              for f in files:
+                args += ["-a", f]
+              args += ["-f", pf.name]
+              try:
+                out = subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
+              except subprocess.CalledProcessError as e:
+                out = e.output
+            return out
+
+          def make_prompt(alert, snippet):
+            rule=alert.get("rule",{}) or {}
+            tool=(alert.get("tool") or {}).get("name","CodeQL")
+            rule_id=rule.get("id",""); rule_name=rule.get("name","")
+            sev=alert.get("rule_severity") or alert.get("severity") or ""
+            inst=alert.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path",""); start=loc.get("start_line"); msg=inst.get("message")
+            msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
+
+            schema = textwrap.dedent("""
+            Return ONLY a single JSON object with fields:
+            - classification: "TP" | "FP" | "UNCERTAIN"
+            - certainty: integer 0-100
+            - rationale: short text
+            - evidence: array of { "path": string, "lines": "optional", "reason": string }
+            - reproduce_steps: short text or null
+            - fix_suggestion: short text
+            """)
+
+            return f"""
+            You are triaging an existing CodeQL alert with full local repo context attached.
+
+            Repository: {OWNER}/{REPO} (tool={tool})
+            Rule: {rule_id} | {rule_name}
+            Severity: {sev}
+            File: {path}:{start}
+            Message: {msg}
+
+            Code context (±12 lines):
+            ```
+            {snippet}
+            ```
+
+            {schema}
+
+            REQUIREMENTS:
+            - Use attached files to validate dataflow/control-flow before deciding FP/TP.
+            - If source is user-controlled AND reaches a sink with insufficient sanitization → TP with proof (paths/files).
+            - If sanitized or guarded by invariant checks, or dead-code, or unreachable path → FP (cite exact code).
+            - If insufficient evidence → UNCERTAIN, describe what extra context is missing.
+            """
+
+          # 1) Pull alerts
+          alerts=[]; page=1
+          while len(alerts) < MAX_ALERTS:
+            batch = list_alerts(ALERT_STATE, page, min(100, MAX_ALERTS - len(alerts)))
+            if not batch: break
+            alerts.extend([a for a in batch if (a.get("tool") or {}).get("name","").lower()=="codeql"])
+            page += 1
+
+          triaged=[]
+          for a in alerts:
+            inst=a.get("most_recent_instance") or {}
+            loc=(inst.get("location") or {})
+            path=loc.get("path") or ""; start=loc.get("start_line") or 1; end=loc.get("end_line") or start
+
+            file_text = read_file(path)
+            if not file_text:
+              continue
+            snippet, ctx_files = gather_context(path, start, end)
+
+            ai_text = cursor_run(make_prompt(a, snippet), ctx_files)
+
+            # Try parsing strict JSON; if not, fall back to regex
+            parsed=None
+            m = re.search(r'\{.*\}\s*$', ai_text, flags=re.S)
+            if m:
+              try:
+                parsed=json.loads(m.group(0))
+              except Exception:
+                pass
+            if not parsed:
+              parsed={"classification":"UNCERTAIN","certainty":0,"rationale":ai_text[:800],"evidence":[],"reproduce_steps":None,"fix_suggestion":""}
+
+            rec={
+              "alert_number": a.get("number"),
+              "rule_id": (a.get("rule") or {}).get("id"),
+              "severity": a.get("rule_severity") or a.get("severity"),
+              "path": path,
+              "ai_label": { "TP":"real_issue","FP":"likely_false_positive","UNCERTAIN":"needs_review" }.get(parsed.get("classification","UNCERTAIN"),"needs_review"),
+              "confidence": "high" if (parsed.get("certainty",0)>=70) else ("medium" if parsed.get("certainty",0)>=40 else "low"),
+              "reason": parsed.get("rationale","")[:1200],
+              "suggestions": parsed.get("fix_suggestion","")[:400],
+              "dismissed": False
+            }
+
+            if AUTO_DISMISS and rec["ai_label"]=="likely_false_positive" and rec["confidence"] in ("high","medium") and path and (path.lower() and any(h in path.lower() for h in SAFE_HINTS)):
+              url = f"https://api.github.com/repos/{OWNER}/{REPO}/code-scanning/alerts/{a.get('number')}"
+              r = sess.patch(url, json={"state": "dismissed", "dismissed_reason": DISMISS_REASON}, timeout=60)
+              rec["dismissed"] = r.status_code in (200,201)
+
+            triaged.append(rec)
+
+          # 3) Summary table
+          md = [
+            f"Scope: state={ALERT_STATE} | Reviewed: {len(triaged)} | Auto-dismiss: {'Yes' if AUTO_DISMISS else 'No'}",
+            "",
+            "| Alert # | Rule | Sev | Path | AI label | Conf | Dismissed |",
+            "|---:|---|:---:|---|---|:--:|:--:|",
+          ]
+          for r in triaged:
+            md.append(f"| {r['alert_number']} | `{r['rule_id']}` | {r['severity'] or ''} | `{r['path']}` | **{r['ai_label']}** | {r['confidence']} | {'✔️' if r['dismissed'] else ''} |")
+          if SUMMARY_PATH:
+            with open(SUMMARY_PATH, "a", encoding="utf-8") as f:
+              f.write("\n".join(md) + "\n")
+
+          with open("cursor-ai-triage.json","w",encoding="utf-8") as f:
+            json.dump(triaged, f, indent=2)
+
+          print("Triage complete. See Job Summary and cursor-ai-triage.json artifact.")
+          PY
+
+      - name: Upload triage JSON
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cursor-ai-triage
+          path: cursor-ai-triage.json
+          if-no-files-found: error
