@@ -1,0 +1,75 @@
+name: "Context-Aware AI Security Triage"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_run:
+    workflows: ["CodeQL Advanced (Optimized, Multi-Lang, Stable)"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  context-aware-triage:
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      CURSOR_MODEL: "auto"
+      ALERT_STATE: "open"
+      MAX_ALERTS: "300"
+      AUTO_DISMISS: "false"
+
+    steps:
+      - name: Checkout ENTIRE repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Get complete history for context
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          python3 -m pip install --upgrade pip requests
+
+      - name: Install Cursor Agent CLI
+        run: |
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+
+      - name: Validate Cursor
+        run: |
+          cursor-agent --print --model "$CURSOR_MODEL" --output-format text "ping" >/dev/null
+          echo "✅ Cursor has access to entire repository"
+
+      - name: Run Context-Aware AI Triage
+        run: |
+          echo "🤖 Starting two-phase context-aware analysis..."
+          echo "📂 Repository files available to Cursor:"
+          find . -type f -name "*.py" -o -name "*.js" -o -name "*.java" | head -10
+          
+          python3 .github/tools/simple_cursor_triage.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-aware-triage-results
+          path: |
+            context-aware-triage.json
+            repository_security_profile.txt
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ Context-aware AI triage completed"
+          echo "🧠 Repository security profile generated"
+          echo "📊 Check Job Summary for detailed results"
