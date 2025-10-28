@@ -114,7 +114,7 @@ jobs:
             lines = (s or "").splitlines()
             if not lines: return ""
             sidx = max(1,(start or 1)-ctx); eidx = min(len(lines),(end or start or 1)+ctx)
-            return "\n".join(f\"{i+1:>5}: {lines[i]}\" for i in range(sidx-1,eidx))
+            return "\n".join(f"{i+1:>5}: {lines[i]}" for i in range(sidx-1, eidx))
 
           def run(cmd):
             return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
@@ -171,7 +171,7 @@ jobs:
 
             # neighbor hits by ripgrep
             for sym in symbol_candidates(snippet)[:15]:
-              for line in rg(rf'\\b{re.escape(sym)}\\b')[:50]:
+              for line in rg(rf'\b{re.escape(sym)}\b')[:50]:
                 f=line.split(":")[0]
                 if f.startswith("./"): f=f[2:]
                 if pathlib.Path(f).is_file(): files.add(f)
@@ -198,17 +198,17 @@ jobs:
                 try:
                   data = open(f, "r", encoding="utf-8").read()
                   chunk = data[: min(len(data), 4000, remaining)]
-                  context_blobs.append(f\"\\n---\\n### File: {f}\\n```\\n{chunk}\\n```\\n\")
+                  context_blobs.append(f"\n---\n### File: {f}\n```\n{chunk}\n```\n")
                   remaining -= len(chunk)
                 except Exception:
                   pass
 
-            full_prompt = prompt_text + "\\n\\n" + "".join(context_blobs)
+            full_prompt = prompt_text + "\n\n" + "".join(context_blobs)
             # Inline rules/policy if present
             try:
               if os.path.exists(CURSOR_RULES):
                 rules_text = open(CURSOR_RULES, "r", encoding="utf-8").read()
-                full_prompt += "\\n\\n---\\n# Policy Rules\\n" + rules_text
+                full_prompt += "\n\n---\n# Policy Rules\n" + rules_text
             except Exception:
               pass
 
