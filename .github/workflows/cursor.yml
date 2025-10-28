@@ -202,7 +202,7 @@ jobs:
           def cursor_run(prompt_text, files):
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as pf:
               pf.write(prompt_text); pf.flush()
-              args = ["cursor-agent","-p","--rules", CURSOR_RULES,"--format","text","--timeout","180"]
+              args = ["cursor-agent","-p","--format","text","--timeout","180"]
               # use model flag only if supported
               if MODEL_FLAG and CURSOR_MODEL:
                 args += [MODEL_FLAG, CURSOR_MODEL]
