@@ -1,9 +1,9 @@
-name: "Cursor AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
+name: "AI Triage & Summary Existing Code Scanning Alerts (Cursor)"
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * 1"
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
 
 permissions:
   contents: read
@@ -19,8 +19,8 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Cursor
-      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
-      CURSOR_MODEL: "auto"      # used if your CLI supports a model flag
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}   # set this in repo/org secrets
+      CURSOR_MODEL: "auto"                            # allowed: auto, sonnet-4.5, sonnet-4.5-thinking, gpt-5, gpt-5-codex, opus-4.1, grok
       CURSOR_RULES: ".github/tools/cursor-rules.md"
 
       # Triage knobs
@@ -31,9 +31,10 @@ jobs:
       SAFE_PATH_HINTS: "test,__tests__,spec,dist,build,node_modules,vendor,generated,coverage,min.js"
 
     steps:
-      - name: Checkout
+      - name: Checkout (for code context)
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Install system deps
         run: |
@@ -42,7 +43,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install requests pexpect
 
-      - name: Setup Node 20 (some Cursor wrappers expect Node)
+      - name: Setup Node 20 (some Cursor wrappers expect Node on PATH)
         uses: actions/setup-node@v4
         with:
           node-version: '20'
@@ -69,14 +70,16 @@ jobs:
           elif echo "$HELP" | grep -q ' -m '; then
             cursor-agent -p -m "$CURSOR_MODEL" -f <(echo ok) >/dev/null
           else
-            # No model flag supported—run with defaults
             cursor-agent -p -f <(echo ok) >/dev/null
           fi
           echo "Auth & CLI sanity OK."
-
+          echo "Help flags of Cursor"
+          cursor-agent --help
+          
       - name: Ensure rules file exists
         run: |
           test -f "$CURSOR_RULES" || { echo "Missing $CURSOR_RULES"; exit 1; }
+          echo "Using Cursor Rules at $CURSOR_RULES"
 
       - name: Triage existing Code Scanning alerts with Cursor
         id: triage
@@ -188,7 +191,7 @@ jobs:
             p = (p or "").lower()
             return any(h in p for h in SAFE_HINTS)
 
-          # detect model flag support once
+          # ---- Flag detection helpers ----
           def detect_model_flag():
             try:
               help_txt = subprocess.check_output(["cursor-agent","--help"], text=True, stderr=subprocess.STDOUT)
@@ -197,17 +200,46 @@ jobs:
             except Exception: pass
             return None
 
-          MODEL_FLAG = detect_model_flag()
+          def has_flag(flag: str) -> bool:
+            try:
+              help_txt = subprocess.check_output(["cursor-agent","--help"], text=True, stderr=subprocess.STDOUT)
+              return flag in help_txt
+            except Exception:
+              return False
 
+          MODEL_FLAG = detect_model_flag()
+          FORMAT_SUPPORTED  = has_flag("--format")
+          TIMEOUT_SUPPORTED = has_flag("--timeout")
+          RULES_SUPPORTED   = has_flag("--rules")  # we inline rules anyway
+
+          # ---- Cursor runner (flag-agnostic) ----
           def cursor_run(prompt_text, files):
+            # Build prompt file and (optionally) append policy rules
             with tempfile.NamedTemporaryFile("w", delete=False, suffix=".md") as pf:
-              pf.write(prompt_text); pf.flush()
-              args = ["cursor-agent","-p","--format","text","--timeout","180"]
-              # use model flag only if supported
+              pf.write(prompt_text)
+              try:
+                if os.path.exists(CURSOR_RULES):
+                  pf.write("\n\n---\n# Policy Rules\n")
+                  pf.write(open(CURSOR_RULES, "r", encoding="utf-8").read())
+              except Exception:
+                pass
+              pf.flush()
+
+              args = ["cursor-agent", "-p"]
+
               if MODEL_FLAG and CURSOR_MODEL:
                 args += [MODEL_FLAG, CURSOR_MODEL]
-              for f in files: args += ["-a", f]
+
+              if FORMAT_SUPPORTED:
+                args += ["--format", "text"]
+              if TIMEOUT_SUPPORTED:
+                args += ["--timeout", "180"]
+              # if RULES_SUPPORTED: args += ["--rules", CURSOR_RULES]  # not required; inlined above
+
+              for f in files:
+                args += ["-a", f]
               args += ["-f", pf.name]
+
               try:
                 out = subprocess.check_output(args, text=True, stderr=subprocess.STDOUT)
               except subprocess.CalledProcessError as e:
