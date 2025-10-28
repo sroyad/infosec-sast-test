@@ -81,7 +81,7 @@ jobs:
         shell: bash
         run: |
           python3 - << 'PY'
-          import os, json, re, textwrap, subprocess, tempfile, pathlib, requests
+          import os, json, re, textwrap, subprocess, pathlib, requests
 
           OWNER=os.environ["OWNER"]; REPO=os.environ["REPO"]; GH=os.environ["GITHUB_TOKEN"]
           ALERT_STATE=os.getenv("ALERT_STATE","open")
@@ -178,8 +178,8 @@ jobs:
 
             noisey=("node_modules/","vendor/","dist/","build/","coverage/","min.js")
             files={f for f in files if not any(n in f for n in noisey)}
-            # cap to avoid huge prompts
-            files = list(sorted(files))[:12]
+            # cap to avoid huge prompts (bumped to 20)
+            files = list(sorted(files))[:20]
             return snippet, files
 
           def safe_path(p: str) -> bool:
@@ -190,7 +190,6 @@ jobs:
           def cursor_run(prompt_text, files):
             # Inline file contents into the prompt (no -a / --rules)
             context_blobs = []
-            # keep total context reasonable
             remaining = 22000  # crude cap to avoid overly long prompts
             for f in files:
               if remaining <= 0: break
@@ -216,7 +215,7 @@ jobs:
               "cursor-agent",
               "--print",
               "--model", CURSOR_MODEL,
-              "--output-format", "text",
+              "--output-format", "json",   # force JSON from Cursor
               full_prompt
             ]
             try:
@@ -237,13 +236,15 @@ jobs:
             msg = (msg or {}).get("text") if isinstance(msg,dict) else (msg or "")
 
             schema = textwrap.dedent("""
-            Return ONLY a single JSON object with fields:
-            - classification: "TP" | "FP" | "UNCERTAIN"
-            - certainty: integer 0-100
-            - rationale: short text
-            - evidence: array of { "path": string, "lines": "optional", "reason": string }
-            - reproduce_steps: short text or null
-            - fix_suggestion: short text
+            You MUST return ONLY a single JSON object with EXACTLY these fields (no prose, no backticks):
+            {
+              "classification": "TP" | "FP" | "UNCERTAIN",
+              "certainty": <integer 0-100>,
+              "rationale": "<<= 800 chars>",
+              "evidence": [ { "path": "<string>", "lines": "<optional>", "reason": "<string>" } ],
+              "reproduce_steps": "<string or null>",
+              "fix_suggestion": "<string>"
+            }
             """)
 
             return f"""
@@ -262,12 +263,40 @@ jobs:
 
             {schema}
 
-            REQUIREMENTS:
-            - Use the inlined files (below) to verify dataflow/control-flow before deciding FP/TP.
-            - If source is user-controlled AND reaches a sink with insufficient sanitization → TP (cite files/lines).
-            - If sanitized/guarded/constant/unused → FP (cite exact code).
-            - If insufficient evidence → UNCERTAIN; list which extra files/paths are missing.
+            STRICT OUTPUT RULES:
+            - Output MUST be a single JSON object only. No extra text before/after.
+            - Decide using the inlined files below (data/control-flow).
+            - If user-controlled source reaches a sensitive sink without sufficient sanitization → "TP".
+            - If properly sanitized/guarded/constant/unused → "FP".
+            - If not enough evidence → "UNCERTAIN" and list missing files/paths in "rationale".
             """
+
+          def parse_ai_output(text: str):
+            # 1) Try to extract a JSON object anywhere in the output
+            try:
+              first_brace = text.find("{")
+              last_brace  = text.rfind("}")
+              if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+                candidate = text[first_brace:last_brace+1]
+                return json.loads(candidate)
+            except Exception:
+              pass
+
+            # 2) Fallback: infer from phrases (TP/FP/UNCERTAIN)
+            t = (text or "").lower()
+            cls = "UNCERTAIN"
+            if re.search(r'\b(true\s*positive|tp)\b', t): cls = "TP"
+            elif re.search(r'\b(false\s*positive|fp)\b', t): cls = "FP"
+            m = re.search(r'(certainty|confidence)\D{0,10}(\d{1,3})', t)
+            certainty = max(0, min(100, int(m.group(2)))) if m else 0
+            return {
+              "classification": cls,
+              "certainty": certainty,
+              "rationale": text[:800],
+              "evidence": [],
+              "reproduce_steps": None,
+              "fix_suggestion": ""
+            }
 
           # 1) Pull alerts
           alerts=[]; page=1
@@ -287,15 +316,7 @@ jobs:
             snippet, ctx_files = gather_context(path, start, end)
 
             ai_text = cursor_run(make_prompt(a, snippet), ctx_files)
-
-            # Try to parse a trailing JSON object from the output
-            parsed=None
-            m = re.search(r'\\{.*\\}\\s*$', ai_text, flags=re.S)
-            if m:
-              try: parsed=json.loads(m.group(0))
-              except Exception: pass
-            if not parsed:
-              parsed={"classification":"UNCERTAIN","certainty":0,"rationale":ai_text[:800],"evidence":[],"reproduce_steps":None,"fix_suggestion":""}
+            parsed = parse_ai_output(ai_text)
 
             rec={
               "alert_number": a.get("number"),
