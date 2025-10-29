@@ -267,8 +267,9 @@ def generate_summary(triaged_alerts):
     # Generate markdown summary
     if SUMMARY_PATH:
         md = [
-            "# 🤖 Context-Aware AI Security Triage Results",
+            "# Full Context-Aware AI Security Triage Results",
             "",
+            f"===Created with <3 by Shuvamoy===",
             f"**Repository:** {OWNER}/{REPO}",
             f"**Analysis Approach:** Two-phase (Repository Understanding → Alert Analysis)",
             "",
