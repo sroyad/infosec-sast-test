@@ -70,7 +70,7 @@ jobs:
       - name: Ensure rules file exists
         run: |
           test -f "$CURSOR_RULES" || { echo "❌ Missing $CURSOR_RULES"; exit 1; }
-          echo "✅ Using Cursor Rules at $CURSOR_RULES"
+          echo "✅ Using Custom Created Rules at $CURSOR_RULES"
 
       - name: Make triage script executable
         run: chmod +x .github/tools/cursor_triage.py
@@ -98,6 +98,7 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "✅ AI Triage workflow completed"
-          echo "📊 Check the Job Summary tab for detailed results"
+          echo "===Created with <3 by Shuvamoy==="
+          echo "===AI Analysis & Triage workflow completed==="
+          echo "+++Check the Job Summary tab for detailed results+++"
           echo "📁 Download cursor-ai-triage-results artifact for full data"
