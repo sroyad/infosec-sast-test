@@ -3,11 +3,7 @@ name: "Context-Aware AI Security Triage"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 3 * * 1" # Mondays 03:17 UTC
-  workflow_run:
-    workflows: ["CodeQL Advanced (Optimized, Multi-Lang, Stable)"]
-    types: [completed]
-    branches: [main]
+    - cron: "0 12 * * 0" # Sundays 12:00 UTC (12pm)
 
 permissions:
   contents: read
