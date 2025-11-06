@@ -1,0 +1,29 @@
+# .github/workflows/test-shellcheck.yml
+name: "Test ShellCheck Integration"
+
+on:
+  workflow_dispatch:  # Manual trigger only
+  
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test-shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for shell files
+        run: |
+          echo "Looking for shell scripts..."
+          find . -name "*.sh" -o -name "*.bash" | head -10
+          
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        
+      - name: Run ShellCheck (test)
+        run: |
+          find . -name "*.sh" -exec shellcheck --format=json {} + > shellcheck-results.json || true
+          echo "ShellCheck results:"
+          cat shellcheck-results.json | head -20
