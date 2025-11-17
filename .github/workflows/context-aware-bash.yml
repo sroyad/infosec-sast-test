@@ -1,0 +1,96 @@
+name: "Bash Context-Aware AI Security Triage"
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC (as requested)
+  workflow_run:
+    workflows: ["CodeQL Advanced (Optimized, Multi-Lang, Stable)"]
+    types: [completed]
+    branches: [main, master, develop]
+
+permissions:
+  contents: read              # Read repository files
+  security-events: write      # Read/dismiss security alerts  
+  actions: read              # Read workflow information
+  metadata: read             # Read repository metadata
+  pull-requests: read        # Read PR information (if triggered by PR)
+  issues: read               # Read issues (for context)
+
+jobs:
+  context-aware-triage:
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      CURSOR_MODEL: "auto"
+      ALERT_STATE: "open"
+      MAX_ALERTS: "300"
+      AUTO_DISMISS: "false"
+
+    steps:
+      - name: Checkout ENTIRE repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # Get complete history for context
+          token: ${{ secrets.GITHUB_TOKEN }}  # Explicit token reference
+        timeout-minutes: 5    # Fail fast if checkout issues
+        
+      - name: Verify repository access
+        run: |
+          echo "✅ Repository successfully checked out"
+          echo "📂 Working directory: $(pwd)"
+          echo "📊 Total files accessible: $(find . -type f | wc -l)"
+          echo "🔐 Verifying GitHub API access..."
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Install Cursor Agent CLI
+        run: |
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+
+      - name: Validate Cursor
+        run: |
+          cursor-agent --print --model "$CURSOR_MODEL" --output-format text "ping" >/dev/null
+          echo "✅ Cursor has access to entire repository"
+
+      - name: Make triage script executable
+        run: chmod +x .github/tools/simple_cursor_triage.sh
+
+      - name: Run Context-Aware AI Triage
+        run: |
+          echo "🤖 Starting two-phase context-aware analysis..."
+          echo "📂 Complete repository structure available to Cursor:"
+          echo "📊 Total files: $(find . -type f | wc -l)"
+          echo "📄 Source files: $(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.java" -o -name "*.go" -o -name "*.rs" -o -name "*.cpp" \) | wc -l)"
+          echo "⚙️ Config files: $(find . -type f \( -name "*.json" -o -name "*.yml" -o -name "*.yaml" -o -name "*.toml" -o -name "*.xml" \) | wc -l)"
+          echo "🔧 Build/Deploy files: $(find . -type f \( -name "Makefile" -o -name "Dockerfile" -o -name "*.gradle" -o -name "pom.xml" \) | wc -l)"
+          echo ""
+          echo "🧠 cursor-agent will analyze ALL files above for complete context understanding"
+          echo ""
+          
+          ./.github/tools/simple_cursor_triage.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: context-aware-triage-results
+          path: |
+            context-aware-triage.json
+            repository_security_profile.txt
+          retention-days: 30
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ Context-aware AI triage completed"
+          echo "🧠 Repository security profile generated"
+          echo "📊 Check Job Summary for detailed results"
