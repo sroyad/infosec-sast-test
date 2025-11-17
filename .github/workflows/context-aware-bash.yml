@@ -3,7 +3,7 @@ name: "Bash Context-Aware AI Security Triage"
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC
+    - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC (as requested)
   workflow_run:
     workflows: ["CodeQL Advanced (Optimized, Multi-Lang, Stable)"]
     types: [completed]
@@ -12,10 +12,10 @@ on:
 permissions:
   contents: read              # Read repository files
   security-events: write      # Read/dismiss security alerts  
-  actions: read               # Read workflow information
-  metadata: read              # Read repository metadata
-  pull-requests: read         # Read PR information (if triggered by PR)
-  issues: read                # Read issues (for context)
+  actions: read              # Read workflow information
+  metadata: read             # Read repository metadata
+  pull-requests: read        # Read PR information (if triggered by PR)
+  issues: read               # Read issues (for context)
 
 jobs:
   context-aware-triage:
@@ -36,6 +36,7 @@ jobs:
         with:
           fetch-depth: 0      # Get complete history for context
           token: ${{ secrets.GITHUB_TOKEN }}  # Explicit token reference
+        timeout-minutes: 5    # Fail fast if checkout issues
         
       - name: Verify repository access
         run: |
@@ -93,4 +94,3 @@ jobs:
           echo "✅ Context-aware AI triage completed"
           echo "🧠 Repository security profile generated"
           echo "📊 Check Job Summary for detailed results"
-
