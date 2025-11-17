@@ -36,7 +36,6 @@ jobs:
         with:
           fetch-depth: 0      # Get complete history for context
           token: ${{ secrets.GITHUB_TOKEN }}  # Explicit token reference
-        timeout-minutes: 5    # ✅ FIXED: Moved to correct indentation level
         
       - name: Verify repository access
         run: |
