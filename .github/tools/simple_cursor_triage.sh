@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-=======
 
->>>>>>> 9ac85b6923e5198f6f76c1f170423667fc1dd8ef
 #!/usr/bin/env bash
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
@@ -310,7 +307,12 @@ Given your complete understanding of this repository's architecture, security co
         local classification=$(echo "${parsed}" | jq -r '.classification // "UNCERTAIN"')
         local certainty=$(echo "${parsed}" | jq -r '.certainty // 30')
         local rationale=$(echo "${parsed}" | jq -r '.rationale // "Could not parse AI response"' | head -c 1500)
-        local context_factors=$(echo "${parsed}" | jq -c '.repository_context_factors // []')
+        # Ensure context_factors is always valid JSON array
+        local context_factors=$(echo "${parsed}" | jq -c '.repository_context_factors // []' 2>/dev/null || echo "[]")
+        # Validate it's actually valid JSON
+        if ! echo "${context_factors}" | jq empty 2>/dev/null; then
+            context_factors="[]"
+        fi
         local exploitability=$(echo "${parsed}" | jq -r '.exploitability // "unknown"')
         local fix_suggestion=$(echo "${parsed}" | jq -r '.fix_suggestion // "Manual review required"' | head -c 500)
     else
@@ -374,6 +376,23 @@ Given your complete understanding of this repository's architecture, security co
         fi
     fi
     
+    # Ensure certainty is a valid number
+    if ! [[ "${certainty}" =~ ^[0-9]+$ ]]; then
+        certainty=30
+    fi
+    
+    # Ensure context_factors is valid JSON array
+    local context_factors_json
+    context_factors_json=$(echo "${context_factors}" | jq . 2>/dev/null || echo "[]")
+    
+    # Ensure dismissed is valid JSON boolean
+    local dismissed_json
+    if [ "${dismissed}" = "true" ]; then
+        dismissed_json="true"
+    else
+        dismissed_json="false"
+    fi
+    
     # Output result as JSON
     jq -n \
         --arg alert_number "${alert_number}" \
@@ -384,10 +403,10 @@ Given your complete understanding of this repository's architecture, security co
         --arg confidence "${confidence}" \
         --argjson certainty_score "${certainty}" \
         --arg reason "${rationale}" \
-        --argjson context_factors "${context_factors}" \
+        --argjson context_factors "${context_factors_json}" \
         --arg exploitability "${exploitability}" \
         --arg suggestions "${fix_suggestion}" \
-        --argjson dismissed "${dismissed}" \
+        --argjson dismissed "${dismissed_json}" \
         '{
             alert_number: $alert_number,
             rule_id: $rule_id,
