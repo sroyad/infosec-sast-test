@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-=======
-
->>>>>>> 9ac85b6923e5198f6f76c1f170423667fc1dd8ef
 #!/usr/bin/env bash
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
@@ -98,14 +94,51 @@ cursor_run() {
 # GitHub API Functions
 ###############################################################################
 
+test_github_access() {
+    local test_url="https://api.github.com/repos/${OWNER}/${REPO}"
+    local response
+    local http_code
+    
+    response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${GH_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        "${test_url}")
+    
+    http_code=$(echo "${response}" | tail -n1)
+    
+    case "${http_code}" in
+        200)
+            log_success "Successfully connected to ${OWNER}/${REPO}"
+            return 0
+            ;;
+        404)
+            log_error "Repository ${OWNER}/${REPO} not found or no access permissions"
+            log_info "This may be a private repository with insufficient token permissions"
+            return 1
+            ;;
+        *)
+            log_error "GitHub API error: HTTP ${http_code}"
+            echo "${response}" | head -n-1 | head -c 200
+            return 1
+            ;;
+    esac
+}
+
 get_codeql_alerts() {
     log_info "Fetching CodeQL alerts from GitHub API..."
     
-    local alerts="[]"
-    local page=1
+    # Test access first
+    if ! test_github_access; then
+        echo "[]" > "${ALERTS_FILE}"
+        return 1
+    fi
     
-    while [ "$(echo "${alerts}" | jq 'length')" -lt "${MAX_ALERTS}" ]; do
-        local per_page=$((MAX_ALERTS - $(echo "${alerts}" | jq 'length')))
+    local page=1
+    local all_alerts="[]"
+    local fetched_count=0
+    
+    while [ "${fetched_count}" -lt "${MAX_ALERTS}" ]; do
+        local per_page=$((MAX_ALERTS - fetched_count))
         [ ${per_page} -gt 100 ] && per_page=100
         
         local url="https://api.github.com/repos/${OWNER}/${REPO}/code-scanning/alerts"
@@ -115,8 +148,7 @@ get_codeql_alerts() {
         response=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "${url}?state=${ALERT_STATE}&page=${page}&per_page=${per_page}&sort=created&direction=desc" \
-            --max-time 60)
+            "${url}?state=${ALERT_STATE}&page=${page}&per_page=${per_page}&sort=created&direction=desc")
         
         http_code=$(echo "${response}" | tail -n1)
         local body=$(echo "${response}" | head -n-1)
@@ -124,24 +156,31 @@ get_codeql_alerts() {
         case "${http_code}" in
             200)
                 # Filter to only CodeQL alerts (ignore other scanners)
-                local batch=$(echo "${body}" | jq '.')
-                local codeql_alerts=$(echo "${batch}" | jq '[.[] | select((.tool.name // "" | ascii_downcase) == "codeql")]')
+                local scanner_alerts=$(echo "${body}" | jq '[.[] | select(
+                    (.tool.name // "" | ascii_downcase) == "codeql"
+                )]')
                 
-                local count=$(echo "${codeql_alerts}" | jq 'length')
+                local count=$(echo "${scanner_alerts}" | jq 'length')
+                
+                if [ "${count}" -gt 0 ]; then
+                    log_info "Page ${page}: ${count} CodeQL alerts found"
+                else
+                    log_info "Page ${page}: No CodeQL alerts found (this may be the last page)"
+                fi
                 
                 if [ "${count}" -eq 0 ]; then
                     break
                 fi
                 
-                log_info "📄 Page ${page}: ${count} CodeQL alerts"
-                
                 # Merge with existing alerts
-                alerts=$(echo "${alerts}" | jq --argjson new "${codeql_alerts}" '. + $new')
+                all_alerts=$(echo "${all_alerts}" | jq --argjson new "${scanner_alerts}" '. + $new')
+                fetched_count=$(echo "${all_alerts}" | jq 'length')
+                
                 page=$((page + 1))
                 ;;
             403)
                 log_error "Access denied to code scanning alerts"
-                log_info "Token may lack 'security-events:read' permission"
+                log_info "Token may lack 'security-events:read' permission for private repo"
                 break
                 ;;
             *)
@@ -151,9 +190,13 @@ get_codeql_alerts() {
         esac
     done
     
-    echo "${alerts}" > "${ALERTS_FILE}"
-    local total=$(echo "${alerts}" | jq 'length')
+    echo "${all_alerts}" > "${ALERTS_FILE}"
+    local total=$(echo "${all_alerts}" | jq 'length')
     log_success "Total CodeQL alerts fetched: ${total}"
+    
+    if [ "${total}" -eq 0 ]; then
+        log_warning "No CodeQL alerts found. Only CodeQL alerts are processed (other scanners are ignored)."
+    fi
     
     return 0
 }
@@ -218,18 +261,19 @@ Focus on information that would help determine if common vulnerability classes (
 
 parse_json_response() {
     local response="$1"
+    local parsed_file="${TEMP_DIR}/parsed_json_${RANDOM}.json"
     
     # Try to extract JSON from response (find first complete JSON object)
-    local json_match=$(echo "${response}" | grep -oP '\{(?:[^{}]|(?:\{[^{}]*\}))*\}' | head -n1 || echo "")
+    echo "${response}" | grep -oP '\{(?:[^{}]|(?:\{[^{}]*\}))*\}' | head -n1 > "${parsed_file}" 2>/dev/null || true
     
-    if [ -n "${json_match}" ]; then
-        if echo "${json_match}" | jq empty 2>/dev/null; then
-            echo "${json_match}"
-            return 0
-        fi
+    if [ -s "${parsed_file}" ] && jq empty "${parsed_file}" 2>/dev/null; then
+        cat "${parsed_file}"
+        rm -f "${parsed_file}"
+        return 0
+    else
+        rm -f "${parsed_file}"
+        return 1
     fi
-    
-    return 1
 }
 
 analyze_single_alert() {
@@ -345,7 +389,7 @@ Given your complete understanding of this repository's architecture, security co
     # Build result JSON
     local dismissed=false
     
-    # Auto-dismiss if configured (matching Python logic exactly)
+    # Auto-dismiss if configured
     if [ "${AUTO_DISMISS}" = "true" ] && [ "${ai_label}" = "likely_false_positive" ]; then
         if [ "${confidence}" = "high" ] || [ "${confidence}" = "medium" ]; then
             if [ "${certainty}" -ge 70 ]; then
@@ -359,8 +403,7 @@ Given your complete understanding of this repository's architecture, security co
                     -H "Authorization: Bearer ${GH_TOKEN}" \
                     -H "Accept: application/vnd.github+json" \
                     "${dismiss_url}" \
-                    -d "{\"state\":\"dismissed\",\"dismissed_reason\":\"false positive\",\"dismissed_comment\":\"context-aware AI analysis\"}" \
-                    --max-time 60)
+                    -d '{"state":"dismissed","dismissed_reason":"false positive","dismissed_comment":"Context-aware AI analysis"}')
                 
                 dismiss_code=$(echo "${dismiss_response}" | tail -n1)
                 
@@ -448,9 +491,8 @@ generate_summary() {
     # Generate markdown summary for GitHub Actions
     if [ -n "${SUMMARY_PATH}" ]; then
         {
-            echo "# 🤖 Full Context-Aware AI Security Triage Results"
+            echo "# 🤖 Context-Aware AI Security Triage Results"
             echo ""
-            echo "===Created with <3 by Shuvamoy==="
             echo "**Repository:** ${OWNER}/${REPO}"
             echo "**Analysis Approach:** Two-phase (Repository Understanding → Alert Analysis)"
             echo ""
@@ -507,8 +549,19 @@ main() {
     
     local alert_count=$(jq 'length' "${ALERTS_FILE}")
     if [ "${alert_count}" -eq 0 ]; then
-        log_info "ℹ️  No CodeQL alerts found"
-        return 0
+        log_warning "No CodeQL alerts found in repository"
+        log_info "Note: Only CodeQL alerts are processed (other scanners like Shellcheck are ignored)"
+        log_info ""
+        log_info "This could mean:"
+        log_info "  1. No CodeQL alerts exist (only other scanner alerts present)"
+        log_info "  2. All CodeQL alerts are already dismissed/closed"
+        log_info "  3. CodeQL scanning is not enabled for this repository"
+        log_info ""
+        log_info "To verify, check: https://github.com/${OWNER}/${REPO}/security/code-scanning"
+        # Don't exit - let the workflow complete successfully with 0 alerts
+        echo "[]" > "${RESULTS_FILE}"
+        generate_summary "[]"
+        exit 0
     fi
     
     # Phase 2: Analyze alerts with full context
@@ -524,3 +577,4 @@ main() {
 
 # Execute main function
 main "$@"
+

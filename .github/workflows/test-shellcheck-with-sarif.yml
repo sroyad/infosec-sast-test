@@ -1,0 +1,94 @@
+name: "Test ShellCheck with SARIF Upload"
+
+on:
+  workflow_dispatch:  # Manual trigger only
+  
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test-shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for shell files
+        run: |
+          echo "Looking for shell scripts..."
+          find . -name "*.sh" -o -name "*.bash" | head -10
+          
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+        
+      - name: Run ShellCheck with JSON output
+        run: |
+          find . -name "*.sh" -exec shellcheck --format=json {} + > shellcheck-results.json || true
+          echo "ShellCheck results:"
+          cat shellcheck-results.json | head -50
+          
+      - name: Convert to SARIF and Upload
+        run: |
+          python3 << 'EOF'
+          import json
+          
+          sarif = {
+              "version": "2.1.0",
+              "runs": [{
+                  "tool": {
+                      "driver": {
+                          "name": "ShellCheck",
+                          "version": "0.9.0",
+                          "informationUri": "https://www.shellcheck.net/"
+                      }
+                  },
+                  "results": []
+              }]
+          }
+          
+          try:
+              with open('shellcheck-results.json', 'r') as f:
+                  shellcheck_data = json.load(f)
+              
+              print(f"Processing {len(shellcheck_data)} ShellCheck findings...")
+              
+              for issue in shellcheck_data:
+                  # Include all levels for testing
+                  if issue.get('level') in ['error', 'warning', 'info', 'style']:
+                      result = {
+                          "ruleId": f"SC{issue['code']}",
+                          "message": {"text": f"{issue['message']} (Level: {issue['level']})"},
+                          "level": "error" if issue['level'] == 'error' else "warning",
+                          "locations": [{
+                              "physicalLocation": {
+                                  "artifactLocation": {"uri": issue['file']},
+                                  "region": {
+                                      "startLine": issue['line'],
+                                      "startColumn": issue.get('column', 1)
+                                  }
+                              }
+                          }]
+                      }
+                      sarif['runs'][0]['results'].append(result)
+              
+              print(f"Created SARIF with {len(sarif['runs'][0]['results'])} results")
+              
+          except Exception as e:
+              print(f"Error processing ShellCheck results: {e}")
+              # Create empty SARIF if no results
+              pass
+          
+          with open('shellcheck.sarif', 'w') as f:
+              json.dump(sarif, f, indent=2)
+          
+          print("SARIF file contents:")
+          with open('shellcheck.sarif', 'r') as f:
+              print(f.read()[:1000])
+          EOF
+          
+      - name: Upload to GitHub Security Tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: shellcheck.sarif
+          category: "ShellCheck-Test"
