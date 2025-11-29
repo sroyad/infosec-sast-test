@@ -394,7 +394,9 @@ Given your complete understanding of this repository's architecture, security co
     fi
     
     # Output result as JSON
-    jq -n \
+    # Use a temporary file to capture any jq errors
+    local temp_result="${TEMP_DIR}/result_${alert_number}.json"
+    if ! jq -n \
         --arg alert_number "${alert_number}" \
         --arg rule_id "${rule_id}" \
         --arg severity "${severity}" \
@@ -420,7 +422,34 @@ Given your complete understanding of this repository's architecture, security co
             exploitability: $exploitability,
             suggestions: $suggestions,
             dismissed: $dismissed
-        }'
+        }' > "${temp_result}" 2>&1; then
+        log_error "Failed to create JSON for alert ${alert_number}"
+        cat "${temp_result}" >&2
+        # Return a minimal valid JSON object
+        jq -n \
+            --arg alert_number "${alert_number}" \
+            --arg rule_id "${rule_id}" \
+            --arg severity "${severity}" \
+            --arg path "${path}" \
+            '{
+                alert_number: $alert_number,
+                rule_id: $rule_id,
+                severity: $severity,
+                path: $path,
+                ai_label: "needs_review",
+                confidence: "low",
+                certainty_score: 0,
+                reason: "Error generating result",
+                context_factors: [],
+                exploitability: "unknown",
+                suggestions: "Manual review required",
+                dismissed: false
+            }'
+        return 1
+    fi
+    
+    cat "${temp_result}"
+    rm -f "${temp_result}"
 }
 
 phase2_analyze_alerts() {
@@ -436,8 +465,29 @@ phase2_analyze_alerts() {
         local alert=$(jq ".[$((index - 1))]" "${ALERTS_FILE}")
         
         local result
-        if result=$(analyze_single_alert "${alert}" "${security_profile}" "${index}" "${alerts_count}"); then
-            triaged_alerts=$(echo "${triaged_alerts}" | jq --argjson new "${result}" '. + [$new]')
+        # Temporarily disable exit on error for this command
+        set +e
+        result=$(analyze_single_alert "${alert}" "${security_profile}" "${index}" "${alerts_count}" 2>&1)
+        local analyze_exit=$?
+        set -e
+        
+        if [ ${analyze_exit} -eq 0 ]; then
+            # Validate result is valid JSON before merging
+            if echo "${result}" | jq empty 2>/dev/null; then
+                set +e
+                triaged_alerts=$(echo "${triaged_alerts}" | jq --argjson new "${result}" '. + [$new]' 2>/dev/null)
+                local merge_exit=$?
+                set -e
+                if [ ${merge_exit} -ne 0 ]; then
+                    log_warning "Failed to merge result for alert ${index}, skipping..."
+                fi
+            else
+                log_warning "Invalid JSON result for alert ${index}, skipping..."
+                log_info "Result preview: $(echo "${result}" | head -c 200)..."
+            fi
+        else
+            log_warning "Failed to analyze alert ${index} (exit code: ${analyze_exit}), skipping..."
+            log_info "Error output: $(echo "${result}" | head -c 200)..."
         fi
         
         index=$((index + 1))
@@ -540,6 +590,20 @@ main() {
     
     log_success "Context-aware triage complete!"
 }
+
+# Error handler
+error_handler() {
+    local line_number=$1
+    local error_code=$2
+    log_error "Error occurred at line ${line_number} with exit code ${error_code}"
+    log_error "This may be due to:"
+    log_error "  - Invalid JSON from AI response"
+    log_error "  - GitHub API access issues"
+    log_error "  - Cursor agent failures"
+    exit "${error_code}"
+}
+
+trap 'error_handler ${LINENO} $?' ERR
 
 # Execute main function
 main "$@"
