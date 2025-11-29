@@ -155,23 +155,22 @@ get_codeql_alerts() {
         
         case "${http_code}" in
             200)
-                # Filter alerts from security scanners
+                # Filter to only CodeQL alerts (ignore other scanners)
                 local scanner_alerts=$(echo "${body}" | jq '[.[] | select(
-                    (.tool.name // "" | ascii_downcase) as $tool |
-                    $tool == "codeql" or 
-                    $tool == "shellcheck" or 
-                    $tool == "codenarc" or 
-                    $tool == "template-security" or 
-                    $tool == "makefile-security"
+                    (.tool.name // "" | ascii_downcase) == "codeql"
                 )]')
                 
                 local count=$(echo "${scanner_alerts}" | jq 'length')
                 
+                if [ "${count}" -gt 0 ]; then
+                    log_info "Page ${page}: ${count} CodeQL alerts found"
+                else
+                    log_info "Page ${page}: No CodeQL alerts found (this may be the last page)"
+                fi
+                
                 if [ "${count}" -eq 0 ]; then
                     break
                 fi
-                
-                log_info "Page ${page}: ${count} security alerts from various scanners"
                 
                 # Merge with existing alerts
                 all_alerts=$(echo "${all_alerts}" | jq --argjson new "${scanner_alerts}" '. + $new')
@@ -193,7 +192,11 @@ get_codeql_alerts() {
     
     echo "${all_alerts}" > "${ALERTS_FILE}"
     local total=$(echo "${all_alerts}" | jq 'length')
-    log_success "Total alerts fetched: ${total}"
+    log_success "Total CodeQL alerts fetched: ${total}"
+    
+    if [ "${total}" -eq 0 ]; then
+        log_warning "No CodeQL alerts found. Only CodeQL alerts are processed (other scanners are ignored)."
+    fi
     
     return 0
 }
@@ -546,7 +549,18 @@ main() {
     
     local alert_count=$(jq 'length' "${ALERTS_FILE}")
     if [ "${alert_count}" -eq 0 ]; then
-        log_info "No CodeQL alerts found"
+        log_warning "No CodeQL alerts found in repository"
+        log_info "Note: Only CodeQL alerts are processed (other scanners like Shellcheck are ignored)"
+        log_info ""
+        log_info "This could mean:"
+        log_info "  1. No CodeQL alerts exist (only other scanner alerts present)"
+        log_info "  2. All CodeQL alerts are already dismissed/closed"
+        log_info "  3. CodeQL scanning is not enabled for this repository"
+        log_info ""
+        log_info "To verify, check: https://github.com/${OWNER}/${REPO}/security/code-scanning"
+        # Don't exit - let the workflow complete successfully with 0 alerts
+        echo "[]" > "${RESULTS_FILE}"
+        generate_summary "[]"
         exit 0
     fi
     
