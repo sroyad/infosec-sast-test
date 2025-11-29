@@ -1,4 +1,4 @@
-name: "Context-Aware AI Security Triage"
+name: "AI Security Triage"
 
 on:
   workflow_dispatch:
