@@ -215,17 +215,88 @@ Focus on information that would help determine if common vulnerability classes (
 
 parse_json_response() {
     local response="$1"
+    local temp_file="${TEMP_DIR}/json_parse_${RANDOM}.txt"
+    echo "${response}" > "${temp_file}"
     
-    # Try to extract JSON from response (find first complete JSON object)
-    local json_match=$(echo "${response}" | grep -oP '\{(?:[^{}]|(?:\{[^{}]*\}))*\}' | head -n1 || echo "")
+    # Method 1: Try to extract JSON from code fences (```json ... ``` or ``` ... ```)
+    local json_in_fence=$(sed -n '/```json/,/```/p' "${temp_file}" 2>/dev/null | sed '1d;$d' | jq . 2>/dev/null)
+    if [ -n "${json_in_fence}" ] && [ "${json_in_fence}" != "null" ]; then
+        echo "${json_in_fence}"
+        rm -f "${temp_file}"
+        return 0
+    fi
     
-    if [ -n "${json_match}" ]; then
-        if echo "${json_match}" | jq empty 2>/dev/null; then
-            echo "${json_match}"
+    # Method 2: Try code fences without language specifier
+    json_in_fence=$(sed -n '/```$/,/```$/p' "${temp_file}" 2>/dev/null | sed '1d;$d' | jq . 2>/dev/null)
+    if [ -n "${json_in_fence}" ] && [ "${json_in_fence}" != "null" ]; then
+        echo "${json_in_fence}"
+        rm -f "${temp_file}"
+        return 0
+    fi
+    
+    # Method 3: Use Python to extract JSON (more reliable for multi-line JSON)
+    if command -v python3 >/dev/null 2>&1; then
+        local python_json=$(python3 << 'PYTHON_EOF'
+import sys
+import json
+import re
+
+text = sys.stdin.read()
+
+# Try to find JSON in code fences
+fence_match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
+if fence_match:
+    try:
+        json_obj = json.loads(fence_match.group(1))
+        print(json.dumps(json_obj))
+        sys.exit(0)
+    except:
+        pass
+
+# Try to find JSON object by matching braces
+brace_start = text.find('{')
+if brace_start != -1:
+    brace_count = 0
+    json_end = -1
+    for i, char in enumerate(text[brace_start:], start=brace_start):
+        if char == '{':
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                json_end = i + 1
+                break
+    
+    if json_end > brace_start:
+        try:
+            json_str = text[brace_start:json_end]
+            json_obj = json.loads(json_str)
+            print(json.dumps(json_obj))
+            sys.exit(0)
+        except:
+            pass
+
+sys.exit(1)
+PYTHON_EOF
+)
+        if [ -n "${python_json}" ]; then
+            echo "${python_json}"
+            rm -f "${temp_file}"
             return 0
         fi
     fi
     
+    # Method 4: Try simple single-line JSON extraction
+    local simple_json=$(echo "${response}" | grep -oP '\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}' | head -n1)
+    if [ -n "${simple_json}" ]; then
+        if echo "${simple_json}" | jq empty 2>/dev/null; then
+            echo "${simple_json}"
+            rm -f "${temp_file}"
+            return 0
+        fi
+    fi
+    
+    rm -f "${temp_file}"
     return 1
 }
 
@@ -300,6 +371,9 @@ Given your complete understanding of this repository's architecture, security co
     if ! ai_response=$(cursor_run "${prompt}"); then
         ai_response="Error: Cursor failed to respond"
     fi
+    
+    # Debug: Log first 500 chars of response for troubleshooting
+    log_info "AI response preview: $(echo "${ai_response}" | head -c 500)..."
     
     # Parse response
     local parsed
