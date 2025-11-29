@@ -24,7 +24,6 @@ permissions:
   contents: read              # Read repository files
   security-events: write      # Read/dismiss security alerts  
   actions: read              # Read workflow information
-  metadata: read             # Read repository metadata
   pull-requests: read        # Read PR information (if triggered by PR)
   issues: read               # Read issues (for context)
 
