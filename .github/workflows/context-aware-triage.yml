@@ -2,13 +2,31 @@ name: "Context-Aware AI Security Triage"
 
 on:
   workflow_dispatch:
+    inputs:
+      auto_dismiss:
+        description: 'Auto-dismiss false positives (true/false)'
+        required: false
+        type: boolean
+        default: false
+      max_alerts:
+        description: 'Maximum alerts to process'
+        required: false
+        type: string
+        default: '300'
   schedule:
-    - cron: "0 12 * * 0" # Sundays 12:00 UTC (12pm)
+    - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC (as requested)
+  workflow_run:
+    workflows: ["CodeQL Advanced (Optimized, Multi-Lang, Stable)"]
+    types: [completed]
+    branches: [main, master, develop]
 
 permissions:
-  contents: read
-  security-events: write
-  actions: read
+  contents: read              # Read repository files
+  security-events: write      # Read/dismiss security alerts  
+  actions: read              # Read workflow information
+  metadata: read             # Read repository metadata
+  pull-requests: read        # Read PR information (if triggered by PR)
+  issues: read               # Read issues (for context)
 
 jobs:
   context-aware-triage:
@@ -20,19 +38,28 @@ jobs:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       CURSOR_MODEL: "auto"
       ALERT_STATE: "open"
-      MAX_ALERTS: "300"
-      AUTO_DISMISS: "false"
+      MAX_ALERTS: ${{ inputs.max_alerts || '300' }}
+      AUTO_DISMISS: ${{ inputs.auto_dismiss == true && 'true' || 'false' }}
 
     steps:
       - name: Checkout ENTIRE repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Get complete history for context
+          fetch-depth: 0      # Get complete history for context
+          token: ${{ secrets.GITHUB_TOKEN }}  # Explicit token reference
+        timeout-minutes: 5    # Fail fast if checkout issues
+        
+      - name: Verify repository access
+        run: |
+          echo "✅ Repository successfully checked out"
+          echo "📂 Working directory: $(pwd)"
+          echo "📊 Total files accessible: $(find . -type f | wc -l)"
+          echo "🔐 Verifying GitHub API access..."
 
       - name: Install dependencies
         run: |
           sudo apt-get update -y
-          python3 -m pip install --upgrade pip requests
+          sudo apt-get install -y jq curl
 
       - name: Install Cursor Agent CLI
         run: |
@@ -45,13 +72,22 @@ jobs:
           cursor-agent --print --model "$CURSOR_MODEL" --output-format text "ping" >/dev/null
           echo "✅ Cursor has access to entire repository"
 
+      - name: Make triage script executable
+        run: chmod +x .github/tools/simple_cursor_triage.sh
+
       - name: Run Context-Aware AI Triage
         run: |
           echo "🤖 Starting two-phase context-aware analysis..."
-          echo "📂 Repository files available to Cursor:"
-          find . -type f -name "*.py" -o -name "*.js" -o -name "*.java" | head -10
+          echo "📂 Complete repository structure available to Cursor:"
+          echo "📊 Total files: $(find . -type f | wc -l)"
+          echo "📄 Source files: $(find . -type f \( -name "*.py" -o -name "*.js" -o -name "*.java" -o -name "*.go" -o -name "*.rs" -o -name "*.cpp" \) | wc -l)"
+          echo "⚙️ Config files: $(find . -type f \( -name "*.json" -o -name "*.yml" -o -name "*.yaml" -o -name "*.toml" -o -name "*.xml" \) | wc -l)"
+          echo "🔧 Build/Deploy files: $(find . -type f \( -name "Makefile" -o -name "Dockerfile" -o -name "*.gradle" -o -name "pom.xml" \) | wc -l)"
+          echo ""
+          echo "🧠 cursor-agent will analyze ALL files above for complete context understanding"
+          echo ""
           
-          python3 .github/tools/simple_cursor_triage.py
+          ./.github/tools/simple_cursor_triage.sh
 
       - name: Upload results
         if: always()
@@ -66,6 +102,22 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          echo "✅ Context-aware AI triage completed"
-          echo "🧠 Repository security profile generated"
-          echo "📊 Check Job Summary for detailed results"
+          echo "## AI Triage Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f "context-aware-triage.json" ]; then
+            total_count=$(jq 'length' context-aware-triage.json)
+            dismissed_count=$(jq '[.[] | select(.dismissed == true)] | length' context-aware-triage.json)
+            fp_count=$(jq '[.[] | select(.ai_label == "likely_false_positive")] | length' context-aware-triage.json)
+            tp_count=$(jq '[.[] | select(.ai_label == "real_issue")] | length' context-aware-triage.json)
+            
+            echo "✅ **Total alerts processed:** ${total_count}" >> $GITHUB_STEP_SUMMARY
+            echo "🔴 **Real issues:** ${tp_count}" >> $GITHUB_STEP_SUMMARY
+            echo "🟡 **False positives:** ${fp_count}" >> $GITHUB_STEP_SUMMARY
+            if [ "${AUTO_DISMISS}" = "true" ]; then
+              echo "🗑️  **Auto-dismissed:** ${dismissed_count}" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "⚠️  **Auto-dismiss:** Disabled" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ No results file found" >> $GITHUB_STEP_SUMMARY
+          fi
