@@ -236,7 +236,7 @@ parse_json_response() {
     
     # Method 3: Use Python to extract JSON (more reliable for multi-line JSON)
     if command -v python3 >/dev/null 2>&1; then
-        local python_json=$(python3 << 'PYTHON_EOF'
+        local python_json=$(cat "${temp_file}" | python3 << 'PYTHON_EOF'
 import sys
 import json
 import re
@@ -273,16 +273,28 @@ if brace_start != -1:
             json_obj = json.loads(json_str)
             print(json.dumps(json_obj))
             sys.exit(0)
-        except:
-            pass
+        except Exception as e:
+            # Try to fix common JSON issues
+            try:
+                # Remove trailing commas
+                json_str = re.sub(r',\s*}', '}', json_str)
+                json_str = re.sub(r',\s*]', ']', json_str)
+                json_obj = json.loads(json_str)
+                print(json.dumps(json_obj))
+                sys.exit(0)
+            except:
+                pass
 
 sys.exit(1)
 PYTHON_EOF
 )
-        if [ -n "${python_json}" ]; then
-            echo "${python_json}"
-            rm -f "${temp_file}"
-            return 0
+        if [ -n "${python_json}" ] && [ "${python_json}" != "null" ]; then
+            # Validate the extracted JSON
+            if echo "${python_json}" | jq empty 2>/dev/null; then
+                echo "${python_json}"
+                rm -f "${temp_file}"
+                return 0
+            fi
         fi
     fi
     
@@ -306,8 +318,8 @@ analyze_single_alert() {
     local alert_index="$3"
     local total_alerts="$4"
     
-    echo ""
-    echo "--- Alert ${alert_index}/${total_alerts} ---"
+    echo "" >&2
+    echo "--- Alert ${alert_index}/${total_alerts} ---" >&2
     
     # Extract alert details using jq
     local alert_number=$(echo "${alert_json}" | jq -r '.number // "N/A"')
@@ -326,7 +338,7 @@ analyze_single_alert() {
         end
     ')
     
-    echo "📍 ${path}:${start_line} - ${rule_id}"
+    echo "📍 ${path}:${start_line} - ${rule_id}" >&2
     
     # Create context-aware prompt
     local prompt="You are a security expert with COMPLETE understanding of this repository.
@@ -372,12 +384,14 @@ Given your complete understanding of this repository's architecture, security co
         ai_response="Error: Cursor failed to respond"
     fi
     
-    # Debug: Log first 500 chars of response for troubleshooting
-    log_info "AI response preview: $(echo "${ai_response}" | head -c 500)..."
+    # Debug: Log first 500 chars of response for troubleshooting (only if verbose)
+    if [ "${DEBUG:-false}" = "true" ]; then
+        log_info "AI response preview: $(echo "${ai_response}" | head -c 500)..."
+    fi
     
     # Parse response
     local parsed
-    if parsed=$(parse_json_response "${ai_response}"); then
+    if parsed=$(parse_json_response "${ai_response}" 2>/dev/null); then
         local classification=$(echo "${parsed}" | jq -r '.classification // "UNCERTAIN"')
         local certainty=$(echo "${parsed}" | jq -r '.certainty // 30')
         local rationale=$(echo "${parsed}" | jq -r '.rationale // "Could not parse AI response"' | head -c 1500)
@@ -416,7 +430,7 @@ Given your complete understanding of this repository's architecture, security co
         confidence="low"
     fi
     
-    echo "🎯 Result: ${ai_label} (confidence: ${confidence}, certainty: ${certainty}%)"
+    echo "🎯 Result: ${ai_label} (confidence: ${confidence}, certainty: ${certainty}%)" >&2
     
     # Build result JSON
     local dismissed=false
@@ -425,7 +439,7 @@ Given your complete understanding of this repository's architecture, security co
     if [ "${AUTO_DISMISS}" = "true" ] && [ "${ai_label}" = "likely_false_positive" ]; then
         if [ "${confidence}" = "high" ] || [ "${confidence}" = "medium" ]; then
             if [ "${certainty}" -ge 70 ]; then
-                log_info "Attempting auto-dismiss..."
+                log_info "Attempting auto-dismiss..." >&2
                 
                 local dismiss_url="https://api.github.com/repos/${OWNER}/${REPO}/code-scanning/alerts/${alert_number}"
                 local dismiss_response
@@ -442,9 +456,9 @@ Given your complete understanding of this repository's architecture, security co
                 
                 if [ "${dismiss_code}" = "200" ] || [ "${dismiss_code}" = "201" ]; then
                     dismissed=true
-                    log_success "Auto-dismissed: true"
+                    log_success "Auto-dismissed: true" >&2
                 else
-                    log_warning "Dismiss failed: HTTP ${dismiss_code}"
+                    log_warning "Dismiss failed: HTTP ${dismiss_code}" >&2
                 fi
             fi
         fi
@@ -539,30 +553,45 @@ phase2_analyze_alerts() {
         local alert=$(jq ".[$((index - 1))]" "${ALERTS_FILE}")
         
         local result
+        local error_output="${TEMP_DIR}/alert_${index}_error.txt"
+        
         # Temporarily disable exit on error for this command
         set +e
-        result=$(analyze_single_alert "${alert}" "${security_profile}" "${index}" "${alerts_count}" 2>&1)
+        # Capture both stdout and stderr separately
+        result=$(analyze_single_alert "${alert}" "${security_profile}" "${index}" "${alerts_count}" 2>"${error_output}")
         local analyze_exit=$?
         set -e
         
         if [ ${analyze_exit} -eq 0 ]; then
+        # The result should now be clean JSON (log messages go to stderr)
+        # But just in case, extract only valid JSON
+        local clean_result=$(echo "${result}" | jq -c . 2>/dev/null || echo "")
+            
             # Validate result is valid JSON before merging
-            if echo "${result}" | jq empty 2>/dev/null; then
+            if [ -n "${clean_result}" ] && echo "${clean_result}" | jq empty 2>/dev/null; then
                 set +e
-                triaged_alerts=$(echo "${triaged_alerts}" | jq --argjson new "${result}" '. + [$new]' 2>/dev/null)
+                triaged_alerts=$(echo "${triaged_alerts}" | jq --argjson new "${clean_result}" '. + [$new]' 2>/dev/null)
                 local merge_exit=$?
                 set -e
                 if [ ${merge_exit} -ne 0 ]; then
                     log_warning "Failed to merge result for alert ${index}, skipping..."
+                    log_info "Merge error - result was: $(echo "${clean_result}" | head -c 200)..."
                 fi
             else
                 log_warning "Invalid JSON result for alert ${index}, skipping..."
-                log_info "Result preview: $(echo "${result}" | head -c 200)..."
+                log_info "Raw result preview: $(echo "${result}" | tail -20 | head -c 300)..."
+                if [ -s "${error_output}" ]; then
+                    log_info "Error output: $(cat "${error_output}" | head -c 200)..."
+                fi
             fi
         else
             log_warning "Failed to analyze alert ${index} (exit code: ${analyze_exit}), skipping..."
-            log_info "Error output: $(echo "${result}" | head -c 200)..."
+            if [ -s "${error_output}" ]; then
+                log_info "Error output: $(cat "${error_output}" | head -c 200)..."
+            fi
         fi
+        
+        rm -f "${error_output}"
         
         index=$((index + 1))
     done
