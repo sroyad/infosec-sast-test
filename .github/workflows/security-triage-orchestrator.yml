@@ -402,6 +402,12 @@ jobs:
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
+      - name: Checkout current repository (for script)
+        uses: actions/checkout@v4
+        with:
+          path: .
+          fetch-depth: 0
+
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
