@@ -51,30 +51,25 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
-      - name: Verify GitHub token permissions
+      - name: Verify GitHub token
         run: |
-          echo "🔐 Verifying GitHub token permissions..."
+          echo "🔐 Verifying GitHub token..."
           response=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/user/permissions")
+            "https://api.github.com/user")
           
           http_code=$(echo "${response}" | tail -n1)
           body=$(echo "${response}" | head -n-1)
           
           if [ "${http_code}" = "200" ]; then
-            echo "✅ Token has access to GitHub API."
-            # Check for specific scopes if needed, e.g., security_events:read
-            if echo "${body}" | jq -e '.organization.admin_security_events' >/dev/null; then
-              echo "✅ Token has 'admin_security_events' permission for organization."
-            else
-              echo "⚠️ Token may lack 'admin_security_events' permission for organization. This might limit discovery."
-            fi
+            username=$(echo "${body}" | jq -r '.login // "unknown"' 2>/dev/null || echo "unknown")
+            echo "✅ GitHub token is valid (authenticated as: ${username})"
           else
-            echo "❌ Failed to verify token permissions: HTTP ${http_code}"
+            echo "⚠️ Warning: Token verification returned HTTP ${http_code}"
             echo "Response body: ${body}"
-            exit 1
+            echo "⚠️ Continuing anyway - actual API calls will validate the token"
           fi
 
       - name: Discover repositories with open CodeQL alerts
