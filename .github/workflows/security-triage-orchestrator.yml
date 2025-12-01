@@ -1,0 +1,362 @@
+name: "Security Triage Orchestrator"
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_dismiss:
+        description: 'Auto-dismiss false positives (true/false)'
+        required: false
+        type: boolean
+        default: false
+      max_alerts_per_repo:
+        description: 'Maximum alerts to process per repository'
+        required: false
+        type: string
+        default: '300'
+      max_repos:
+        description: 'Maximum repositories to process (0 = all, -1 = use test_repos list)'
+        required: false
+        type: string
+        default: '-1'
+      org_name:
+        description: 'Organization name to scan (default: uses GITHUB_REPOSITORY_OWNER)'
+        required: false
+        type: string
+        default: ''
+      use_test_repos:
+        description: 'Use hardcoded test repos list instead of discovery (true/false)'
+        required: false
+        type: boolean
+        default: true  # Default to true to use hardcoded test repos
+  schedule:
+    - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC
+
+permissions:
+  contents: read              # Read repository files
+  security-events: write      # Read/dismiss security alerts
+  actions: read              # Read workflow information
+
+jobs:
+  discover-repos-with-alerts:
+    runs-on: ubuntu-latest
+    outputs:
+      repos: ${{ steps.set-repos.outputs.repos }}
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Discover repositories with open CodeQL alerts
+        id: discover
+        env:
+          ORG_NAME: ${{ inputs.org_name || github.repository_owner }}
+          MAX_REPOS: ${{ inputs.max_repos || '-1' }}
+          USE_TEST_REPOS: ${{ inputs.use_test_repos != false && 'true' || 'false' }}
+        run: |
+          # Hardcoded list of repositories
+          ORG_PREFIX="${ORG_NAME}/"
+          
+          # PROD REPOS (commented out for testing)
+          # TEST_REPOS=(
+          #   "${ORG_PREFIX}payment-methods-ui"
+          #   "${ORG_PREFIX}subscription-ui"
+          #   "${ORG_PREFIX}billing-pricebook-microui"
+          #   "${ORG_PREFIX}prm-opportunities-ui"
+          #   "${ORG_PREFIX}product-ui"
+          #   "${ORG_PREFIX}authz"
+          #   "${ORG_PREFIX}reporting-service"
+          #   "${ORG_PREFIX}ad-checkout-ui"
+          #   "${ORG_PREFIX}revenue-shares-ui"
+          #   "${ORG_PREFIX}pricing"
+          # )
+          
+          # TEST REPOS (for personal account testing)
+          TEST_REPOS=(
+            "${ORG_PREFIX}Lang-Detailed-Breakdown-Percent"
+            "${ORG_PREFIX}test-repo-secret"
+            "${ORG_PREFIX}demo-repo2"
+            "${ORG_PREFIX}demo-repo1"
+            "${ORG_PREFIX}python-codeql-fresh"
+            "${ORG_PREFIX}python-codeql-demo"
+            "${ORG_PREFIX}test-codeql-optimization"
+            "${ORG_PREFIX}actions"
+          )
+          
+          echo "🔍 Discovering repositories with open CodeQL alerts in org: ${ORG_NAME}"
+          
+          repos_json="[]"
+          
+          # Use test repos list if enabled
+          if [ "${USE_TEST_REPOS}" = "true" ] || [ "${MAX_REPOS}" = "-1" ]; then
+            echo "📋 Using hardcoded test repositories list"
+            for repo in "${TEST_REPOS[@]}"; do
+              if [ -z "${repo}" ] || [[ "${repo}" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo "🔍 Checking ${repo} for open CodeQL alerts..."
+              
+              # Check if repo has open CodeQL alerts
+              alerts_response=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${repo}/code-scanning/alerts?state=open&tool_name=codeql&per_page=100")
+              
+              alerts_code=$(echo "${alerts_response}" | tail -n1)
+              alerts_body=$(echo "${alerts_response}" | head -n-1)
+              
+              if [ "${alerts_code}" = "200" ]; then
+                actual_count=$(echo "${alerts_body}" | jq 'if type == "array" then length else 0 end' || echo "0")
+                
+                if [ "${actual_count}" -gt 0 ]; then
+                  echo "✅ Found ${actual_count} open CodeQL alerts in ${repo}"
+                  repos_json=$(echo "${repos_json}" | jq --arg repo "${repo}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
+                else
+                  echo "ℹ️  No open CodeQL alerts in ${repo}, skipping"
+                fi
+              elif [ "${alerts_code}" = "404" ]; then
+                echo "⚠️  Repository ${repo} not found or no access, skipping"
+              else
+                echo "⚠️  Error checking ${repo}: HTTP ${alerts_code}, skipping"
+              fi
+            done
+          else
+            # Dynamic discovery mode
+            echo "🔍 Using dynamic discovery mode"
+            page=1
+            repos_found=0
+          
+          while [ "${repos_found}" -lt "${MAX_REPOS}" ] || [ "${MAX_REPOS}" = "0" ]; do
+            # Get repos with code scanning enabled
+            response=$(curl -s -w "\n%{http_code}" \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/orgs/${ORG_NAME}/repos?type=all&page=${page}&per_page=100&sort=updated")
+            
+            http_code=$(echo "${response}" | tail -n1)
+            body=$(echo "${response}" | head -n-1)
+            
+            if [ "${http_code}" != "200" ]; then
+              echo "⚠️ API error ${http_code}, stopping discovery"
+              break
+            fi
+            
+            repos_batch=$(echo "${body}" | jq -r '.[].full_name' || echo "")
+            
+            if [ -z "${repos_batch}" ] || [ "${repos_batch}" = "null" ]; then
+              break
+            fi
+            
+            # Check each repo for open CodeQL alerts
+            while IFS= read -r repo_full_name; do
+              if [ -z "${repo_full_name}" ]; then
+                continue
+              fi
+              
+              # Check if repo has open CodeQL alerts
+              alerts_response=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=1")
+              
+              alerts_code=$(echo "${alerts_response}" | tail -n1)
+              alerts_body=$(echo "${alerts_response}" | head -n-1)
+              
+              if [ "${alerts_code}" = "200" ]; then
+                alert_count=$(echo "${alerts_body}" | jq 'length' || echo "0")
+                
+                if [ "${alert_count}" -gt 0 ]; then
+                  # Get total alert count
+                  total_alerts=$(curl -s \
+                    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=1" | \
+                    jq 'if type == "array" then length else 0 end' || echo "0")
+                  
+                  # Get full alert list to count properly
+                  full_alerts=$(curl -s \
+                    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=100")
+                  
+                  actual_count=$(echo "${full_alerts}" | jq 'if type == "array" then length else 0 end' || echo "0")
+                  
+                  if [ "${actual_count}" -gt 0 ]; then
+                    echo "✅ Found ${actual_count} open CodeQL alerts in ${repo_full_name}"
+                    repos_json=$(echo "${repos_json}" | jq --arg repo "${repo_full_name}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
+                    repos_found=$((repos_found + 1))
+                    
+                    if [ "${MAX_REPOS}" != "0" ] && [ "${repos_found}" -ge "${MAX_REPOS}" ]; then
+                      break 2
+                    fi
+                  fi
+                fi
+              fi
+            done <<< "${repos_batch}"
+            
+            page=$((page + 1))
+            done
+          fi
+          
+          echo "${repos_json}" | jq .
+          echo "📊 Total repositories with open CodeQL alerts: $(echo "${repos_json}" | jq 'length')"
+          
+          # Set output
+          echo "repos<<EOF" >> $GITHUB_OUTPUT
+          echo "${repos_json}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Set repos output
+        id: set-repos
+        run: |
+          repos='${{ steps.discover.outputs.repos }}'
+          if [ -z "${repos}" ] || [ "${repos}" = "null" ] || [ "${repos}" = "" ]; then
+            repos="[]"
+          fi
+          echo "repos=${repos}" >> $GITHUB_OUTPUT
+          echo "📊 Repos to process: $(echo "${repos}" | jq 'length' || echo "0")"
+
+  triage-repos:
+    needs: discover-repos-with-alerts
+    if: needs.discover-repos-with-alerts.outputs.repos != '[]' && needs.discover-repos-with-alerts.outputs.repos != 'null' && needs.discover-repos-with-alerts.outputs.repos != ''
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.discover-repos-with-alerts.outputs.repos) }}
+      fail-fast: false
+      max-parallel: 5  # Process 5 repos in parallel to avoid rate limits
+    runs-on: ubuntu-latest
+    env:
+      TARGET_REPO: ${{ matrix.repo.repo }}
+      MAX_ALERTS: ${{ inputs.max_alerts_per_repo || '300' }}
+      AUTO_DISMISS: ${{ inputs.auto_dismiss == true && 'true' || 'false' }}
+    steps:
+      - name: Parse repository owner and name
+        id: parse-repo
+        run: |
+          REPO_FULL="${{ matrix.repo.repo }}"
+          OWNER=$(echo "${REPO_FULL}" | cut -d'/' -f1)
+          REPO=$(echo "${REPO_FULL}" | cut -d'/' -f2)
+          
+          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+          echo "repo=${REPO}" >> $GITHUB_OUTPUT
+          echo "📂 Processing: ${OWNER}/${REPO}"
+
+      - name: Checkout central actions repository
+        uses: actions/checkout@v4
+        with:
+          path: actions-repo
+          fetch-depth: 0
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo.repo }}
+          path: target-repo
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl python3
+
+      - name: Install Cursor Agent CLI
+        run: |
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+
+      - name: Validate Cursor
+        run: |
+          cursor-agent --print --model "auto" --output-format text "ping" >/dev/null
+          echo "✅ Cursor agent ready"
+
+      - name: Verify and prepare triage script
+        run: |
+          SCRIPT_PATH="actions-repo/.github/tools/simple_cursor_triage.sh"
+          if [ ! -f "${SCRIPT_PATH}" ]; then
+            echo "❌ Triage script not found at ${SCRIPT_PATH}"
+            echo "📂 Available files in actions-repo/.github/tools/:"
+            ls -la actions-repo/.github/tools/ || echo "Directory does not exist"
+            exit 1
+          fi
+          chmod +x "${SCRIPT_PATH}"
+          echo "✅ Triage script found and made executable"
+
+      - name: Run AI Triage on target repository
+        working-directory: target-repo
+        env:
+          OWNER: ${{ steps.parse-repo.outputs.owner }}
+          REPO: ${{ steps.parse-repo.outputs.repo }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: "auto"
+          ALERT_STATE: "open"
+          MAX_ALERTS: ${{ env.MAX_ALERTS }}
+          AUTO_DISMISS: ${{ env.AUTO_DISMISS }}
+          GITHUB_STEP_SUMMARY: ${{ github.step_summary }}
+        run: |
+          echo "🤖 Starting AI triage for ${OWNER}/${REPO}"
+          echo "📊 Alert count: ${{ matrix.repo.alert_count }}"
+          echo "📂 Working directory: $(pwd)"
+          echo "📄 Script path: $(realpath ../../actions-repo/.github/tools/simple_cursor_triage.sh)"
+          
+          # Verify script exists before running
+          SCRIPT_PATH="../../actions-repo/.github/tools/simple_cursor_triage.sh"
+          if [ ! -f "${SCRIPT_PATH}" ]; then
+            echo "❌ Script not found at ${SCRIPT_PATH}"
+            echo "Current directory: $(pwd)"
+            echo "Parent directory contents:"
+            ls -la ../../
+            exit 1
+          fi
+          
+          # Run the triage script from central repo
+          bash "${SCRIPT_PATH}"
+
+      - name: Upload triage results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-results-${{ steps.parse-repo.outputs.owner }}-${{ steps.parse-repo.outputs.repo }}
+          path: |
+            target-repo/context-aware-triage.json
+            target-repo/repository_security_profile.txt
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Summary for repository
+        if: always()
+        run: |
+          if [ -f "target-repo/context-aware-triage.json" ]; then
+            total=$(jq 'length' target-repo/context-aware-triage.json)
+            tp_count=$(jq '[.[] | select(.ai_label == "real_issue")] | length' target-repo/context-aware-triage.json)
+            fp_count=$(jq '[.[] | select(.ai_label == "likely_false_positive")] | length' target-repo/context-aware-triage.json)
+            dismissed_count=$(jq '[.[] | select(.dismissed == true)] | length' target-repo/context-aware-triage.json)
+            
+            echo "## 📊 Triage Results: ${{ matrix.repo.repo }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Total alerts processed:** ${total}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Real issues:** ${tp_count}" >> $GITHUB_STEP_SUMMARY
+            echo "- **False positives:** ${fp_count}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Auto-dismissed:** ${dismissed_count}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No results file found for ${{ matrix.repo.repo }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  final-summary:
+    needs: [discover-repos-with-alerts, triage-repos]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate final summary
+        run: |
+          echo "# 🎉 Security Triage Orchestrator Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositories processed:** Check individual job results above" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review triage results in artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "2. Check dismissed alerts in Security tab of each repository" >> $GITHUB_STEP_SUMMARY
+          echo "3. Address real issues identified by AI triage" >> $GITHUB_STEP_SUMMARY
+
