@@ -429,6 +429,8 @@ jobs:
           echo "$HOME/.cursor/bin" >> $GITHUB_PATH
 
       - name: Validate Cursor
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           cursor-agent --print --model "auto" --output-format text "ping" >/dev/null
           echo "✅ Cursor agent ready"
