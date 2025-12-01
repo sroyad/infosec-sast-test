@@ -354,7 +354,10 @@ jobs:
           if [ -z "${repos}" ] || [ "${repos}" = "null" ] || [ "${repos}" = "" ]; then
             repos="[]"
           fi
-          echo "repos=${repos}" >> $GITHUB_OUTPUT
+          # Use multi-line EOF syntax for JSON arrays to avoid "Invalid format" errors
+          echo "repos<<EOF" >> $GITHUB_OUTPUT
+          echo "${repos}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
           echo "📊 Repos to process: $(echo "${repos}" | jq 'length' || echo "0")"
 
   triage-repos:
