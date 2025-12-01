@@ -463,17 +463,21 @@ jobs:
           echo "🤖 Starting AI triage for ${OWNER}/${REPO}"
           echo "📊 Alert count: ${{ matrix.repo.alert_count }}"
           echo "📂 Working directory: $(pwd)"
-          echo "📄 Script path: $(realpath ../../actions-repo/.github/tools/simple_cursor_triage.sh)"
+          
+          # From target-repo, go up one level to workspace root, then to actions-repo
+          SCRIPT_PATH="../actions-repo/.github/tools/simple_cursor_triage.sh"
           
           # Verify script exists before running
-          SCRIPT_PATH="../../actions-repo/.github/tools/simple_cursor_triage.sh"
           if [ ! -f "${SCRIPT_PATH}" ]; then
             echo "❌ Script not found at ${SCRIPT_PATH}"
             echo "Current directory: $(pwd)"
             echo "Parent directory contents:"
-            ls -la ../../
+            ls -la ../
+            echo "Looking for script at: $(realpath "${SCRIPT_PATH}" 2>/dev/null || echo "path not found")"
             exit 1
           fi
+          
+          echo "✅ Script found at: $(realpath "${SCRIPT_PATH}")"
           
           # Run the triage script from central repo
           bash "${SCRIPT_PATH}"
