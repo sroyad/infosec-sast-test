@@ -402,13 +402,6 @@ jobs:
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
 
-      - name: Checkout central actions repository
-        uses: actions/checkout@v4
-        with:
-          path: actions-repo
-          fetch-depth: 0
-          token: ${{ steps.token-triage.outputs.token }}
-
       - name: Checkout target repository
         uses: actions/checkout@v4
         with:
@@ -437,15 +430,17 @@ jobs:
 
       - name: Verify and prepare triage script
         run: |
-          SCRIPT_PATH="actions-repo/.github/tools/simple_cursor_triage.sh"
+          # Script is in the same repo as the workflow (automatically checked out by GitHub Actions)
+          SCRIPT_PATH=".github/tools/simple_cursor_triage.sh"
           if [ ! -f "${SCRIPT_PATH}" ]; then
             echo "❌ Triage script not found at ${SCRIPT_PATH}"
-            echo "📂 Available files in actions-repo/.github/tools/:"
-            ls -la actions-repo/.github/tools/ || echo "Directory does not exist"
+            echo "📂 Current directory: $(pwd)"
+            echo "📂 Available files in .github/tools/:"
+            ls -la .github/tools/ || echo "Directory does not exist"
             exit 1
           fi
           chmod +x "${SCRIPT_PATH}"
-          echo "✅ Triage script found and made executable"
+          echo "✅ Triage script found and made executable at: $(realpath "${SCRIPT_PATH}")"
 
       - name: Run AI Triage on target repository
         working-directory: target-repo
@@ -464,8 +459,9 @@ jobs:
           echo "📊 Alert count: ${{ matrix.repo.alert_count }}"
           echo "📂 Working directory: $(pwd)"
           
-          # From target-repo, go up one level to workspace root, then to actions-repo
-          SCRIPT_PATH="../actions-repo/.github/tools/simple_cursor_triage.sh"
+          # Script is in the workspace root (same repo as workflow)
+          # From target-repo, go up one level to workspace root
+          SCRIPT_PATH="../.github/tools/simple_cursor_triage.sh"
           
           # Verify script exists before running
           if [ ! -f "${SCRIPT_PATH}" ]; then
@@ -479,7 +475,7 @@ jobs:
           
           echo "✅ Script found at: $(realpath "${SCRIPT_PATH}")"
           
-          # Run the triage script from central repo
+          # Run the triage script
           bash "${SCRIPT_PATH}"
 
       - name: Upload triage results
