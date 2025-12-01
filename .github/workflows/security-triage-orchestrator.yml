@@ -57,12 +57,23 @@ jobs:
           response=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer ${GITHUB_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/user")
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user/permissions")
+          
           http_code=$(echo "${response}" | tail -n1)
+          body=$(echo "${response}" | head -n-1)
+          
           if [ "${http_code}" = "200" ]; then
-            echo "✅ GitHub token is valid"
+            echo "✅ Token has access to GitHub API."
+            # Check for specific scopes if needed, e.g., security_events:read
+            if echo "${body}" | jq -e '.organization.admin_security_events' >/dev/null; then
+              echo "✅ Token has 'admin_security_events' permission for organization."
+            else
+              echo "⚠️ Token may lack 'admin_security_events' permission for organization. This might limit discovery."
+            fi
           else
-            echo "❌ GitHub token validation failed: HTTP ${http_code}"
+            echo "❌ Failed to verify token permissions: HTTP ${http_code}"
+            echo "Response body: ${body}"
             exit 1
           fi
 
@@ -116,75 +127,65 @@ jobs:
               
               echo "🔍 Checking ${repo} for open CodeQL alerts..."
               
-              # First verify repo exists and is accessible
-              repo_check=$(curl -s -w "\n%{http_code}" \
+              # First, check if the repository exists and is accessible
+              repo_check_response=$(curl -s -w "\n%{http_code}" \
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
                 "https://api.github.com/repos/${repo}")
               
-              repo_check_code=$(echo "${repo_check}" | tail -n1)
+              repo_check_code=$(echo "${repo_check_response}" | tail -n1)
+              repo_check_body=$(echo "${repo_check_response}" | head -n-1)
               
-              if [ "${repo_check_code}" != "200" ]; then
-                if [ "${repo_check_code}" = "404" ]; then
-                  echo "⚠️  Repository ${repo} not found, skipping"
-                elif [ "${repo_check_code}" = "401" ] || [ "${repo_check_code}" = "403" ]; then
-                  echo "⚠️  No access to repository ${repo} (HTTP ${repo_check_code}), skipping"
-                else
-                  echo "⚠️  Error accessing repository ${repo}: HTTP ${repo_check_code}, skipping"
-                fi
+              if [ "${repo_check_code}" = "200" ]; then
+                echo "✅ Repository ${repo} found."
+              elif [ "${repo_check_code}" = "404" ]; then
+                echo "⚠️ Repository ${repo} not found or no access, skipping. Response body: ${repo_check_body}"
+                continue
+              else
+                echo "⚠️ Error checking repository ${repo} existence: HTTP ${repo_check_code}, skipping. Response body: ${repo_check_body}"
+                continue
+              fi
+
+              # Check if code scanning is enabled for the repo
+              code_scanning_status_response=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo}/code-scanning/alerts?per_page=1") # Just check if endpoint is accessible
+              
+              code_scanning_status_code=$(echo "${code_scanning_status_response}" | tail -n1)
+              code_scanning_status_body=$(echo "${code_scanning_status_response}" | head -n-1)
+
+              if [ "${code_scanning_status_code}" = "403" ]; then
+                echo "⚠️ Code scanning is not enabled for ${repo} or token lacks 'security_events:read' permission, skipping. Response body: ${code_scanning_status_body}"
+                continue
+              elif [ "${code_scanning_status_code}" != "200" ]; then
+                echo "⚠️ Error checking code scanning status for ${repo}: HTTP ${code_scanning_status_code}, skipping. Response body: ${code_scanning_status_body}"
                 continue
               fi
               
               # Check if repo has open CodeQL alerts
-              # Use Bearer token format (standard for GitHub API)
               alerts_response=$(curl -s -w "\n%{http_code}" \
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
                 -H "X-GitHub-Api-Version: 2022-11-28" \
-                "https://api.github.com/repos/${repo}/code-scanning/alerts?state=open&tool_name=codeql&per_page=100" 2>&1)
+                "https://api.github.com/repos/${repo}/code-scanning/alerts?state=open&tool_name=CodeQL&per_page=100")
               
               alerts_code=$(echo "${alerts_response}" | tail -n1)
               alerts_body=$(echo "${alerts_response}" | head -n-1)
               
-              # Debug: Log response for troubleshooting
-              if [ "${alerts_code}" != "200" ]; then
-                echo "   Response body: $(echo "${alerts_body}" | head -c 200)"
-              fi
-              
               if [ "${alerts_code}" = "200" ]; then
-                # Filter to only CodeQL alerts (in case tool_name filter doesn't work)
-                codeql_alerts=$(echo "${alerts_body}" | jq '[.[] | select(.tool.name == "CodeQL")]' || echo "[]")
-                actual_count=$(echo "${codeql_alerts}" | jq 'if type == "array" then length else 0 end' || echo "0")
+                actual_count=$(echo "${alerts_body}" | jq 'if type == "array" then length else 0 end' || echo "0")
                 
                 if [ "${actual_count}" -gt 0 ]; then
                   echo "✅ Found ${actual_count} open CodeQL alerts in ${repo}"
                   repos_json=$(echo "${repos_json}" | jq --arg repo "${repo}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
                 else
-                  echo "ℹ️  No open CodeQL alerts in ${repo}, skipping"
+                  echo "ℹ️  No open CodeQL alerts from CodeQL tool in ${repo}, skipping. Response body: ${alerts_body}"
                 fi
-              elif [ "${alerts_code}" = "401" ]; then
-                # 401 usually means authentication failed or insufficient permissions
-                error_msg=$(echo "${alerts_body}" | jq -r '.message // "Authentication failed"' 2>/dev/null || echo "Authentication failed")
-                echo "❌ Authentication failed for ${repo}: HTTP 401"
-                echo "   Error: ${error_msg}"
-                echo "   This may indicate:"
-                echo "   - GITHUB_TOKEN lacks 'security-events:read' permission"
-                echo "   - Repository access restrictions"
-                echo "   Skipping ${repo}"
-              elif [ "${alerts_code}" = "403" ]; then
-                error_msg=$(echo "${alerts_body}" | jq -r '.message // "Access forbidden"' 2>/dev/null || echo "Access forbidden")
-                echo "⚠️  Access forbidden for ${repo}: HTTP 403"
-                echo "   Error: ${error_msg}"
-                echo "   Code scanning may not be enabled or token lacks permissions"
-              elif [ "${alerts_code}" = "404" ]; then
-                error_msg=$(echo "${alerts_body}" | jq -r '.message // "Not found"' 2>/dev/null || echo "Not found")
-                echo "ℹ️  Code scanning not available for ${repo}: HTTP 404"
-                echo "   Error: ${error_msg}"
-                echo "   This usually means code scanning is not enabled or no analysis has been run"
               else
-                error_msg=$(echo "${alerts_body}" | jq -r '.message // "Unknown error"' 2>/dev/null || echo "Unknown error")
-                echo "⚠️  Error checking alerts for ${repo}: HTTP ${alerts_code}"
-                echo "   Error: ${error_msg}"
+                echo "⚠️  Error fetching CodeQL alerts for ${repo}: HTTP ${alerts_code}, skipping. Response body: ${alerts_body}"
               fi
             done
           else
@@ -198,6 +199,7 @@ jobs:
             response=$(curl -s -w "\n%{http_code}" \
               -H "Authorization: Bearer ${GITHUB_TOKEN}" \
               -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/orgs/${ORG_NAME}/repos?type=all&page=${page}&per_page=100&sort=updated")
             
             http_code=$(echo "${response}" | tail -n1)
@@ -220,44 +222,72 @@ jobs:
                 continue
               fi
               
+              echo "🔍 Checking ${repo_full_name} for open CodeQL alerts..."
+
+              # First, check if the repository exists and is accessible
+              repo_check_response=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}")
+              
+              repo_check_code=$(echo "${repo_check_response}" | tail -n1)
+              repo_check_body=$(echo "${repo_check_response}" | head -n-1)
+              
+              if [ "${repo_check_code}" = "200" ]; then
+                echo "✅ Repository ${repo_full_name} found."
+              elif [ "${repo_check_code}" = "404" ]; then
+                echo "⚠️ Repository ${repo_full_name} not found or no access, skipping. Response body: ${repo_check_body}"
+                continue
+              else
+                echo "⚠️ Error checking repository ${repo_full_name} existence: HTTP ${repo_check_code}, skipping. Response body: ${repo_check_body}"
+                continue
+              fi
+
+              # Check if code scanning is enabled for the repo
+              code_scanning_status_response=$(curl -s -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?per_page=1") # Just check if endpoint is accessible
+              
+              code_scanning_status_code=$(echo "${code_scanning_status_response}" | tail -n1)
+              code_scanning_status_body=$(echo "${code_scanning_status_response}" | head -n-1)
+
+              if [ "${code_scanning_status_code}" = "403" ]; then
+                echo "⚠️ Code scanning is not enabled for ${repo_full_name} or token lacks 'security_events:read' permission, skipping. Response body: ${code_scanning_status_body}"
+                continue
+              elif [ "${code_scanning_status_code}" != "200" ]; then
+                echo "⚠️ Error checking code scanning status for ${repo_full_name}: HTTP ${code_scanning_status_code}, skipping. Response body: ${code_scanning_status_body}"
+                continue
+              fi
+
               # Check if repo has open CodeQL alerts
               alerts_response=$(curl -s -w "\n%{http_code}" \
                 -H "Authorization: Bearer ${GITHUB_TOKEN}" \
                 -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=1")
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=CodeQL&per_page=100")
               
               alerts_code=$(echo "${alerts_response}" | tail -n1)
               alerts_body=$(echo "${alerts_response}" | head -n-1)
               
               if [ "${alerts_code}" = "200" ]; then
-                alert_count=$(echo "${alerts_body}" | jq 'length' || echo "0")
+                actual_count=$(echo "${alerts_body}" | jq 'if type == "array" then length else 0 end' || echo "0")
                 
-                if [ "${alert_count}" -gt 0 ]; then
-                  # Get total alert count
-                  total_alerts=$(curl -s \
-                    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                    -H "Accept: application/vnd.github+json" \
-                    "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=1" | \
-                    jq 'if type == "array" then length else 0 end' || echo "0")
+                if [ "${actual_count}" -gt 0 ]; then
+                  echo "✅ Found ${actual_count} open CodeQL alerts in ${repo_full_name}"
+                  repos_json=$(echo "${repos_json}" | jq --arg repo "${repo_full_name}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
+                  repos_found=$((repos_found + 1))
                   
-                  # Get full alert list to count properly
-                  full_alerts=$(curl -s \
-                    -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-                    -H "Accept: application/vnd.github+json" \
-                    "https://api.github.com/repos/${repo_full_name}/code-scanning/alerts?state=open&tool_name=codeql&per_page=100")
-                  
-                  actual_count=$(echo "${full_alerts}" | jq 'if type == "array" then length else 0 end' || echo "0")
-                  
-                  if [ "${actual_count}" -gt 0 ]; then
-                    echo "✅ Found ${actual_count} open CodeQL alerts in ${repo_full_name}"
-                    repos_json=$(echo "${repos_json}" | jq --arg repo "${repo_full_name}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
-                    repos_found=$((repos_found + 1))
-                    
-                    if [ "${MAX_REPOS}" != "0" ] && [ "${repos_found}" -ge "${MAX_REPOS}" ]; then
-                      break 2
-                    fi
+                  if [ "${MAX_REPOS}" != "0" ] && [ "${repos_found}" -ge "${MAX_REPOS}" ]; then
+                    break 2
                   fi
+                else
+                  echo "ℹ️  No open CodeQL alerts from CodeQL tool in ${repo_full_name}, skipping. Response body: ${alerts_body}"
                 fi
+              else
+                echo "⚠️  Error fetching CodeQL alerts for ${repo_full_name}: HTTP ${alerts_code}, skipping. Response body: ${alerts_body}"
               fi
             done <<< "${repos_batch}"
             
@@ -292,6 +322,9 @@ jobs:
       fail-fast: false
       max-parallel: 5  # Process 5 repos in parallel to avoid rate limits
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # Needed to dismiss alerts
     env:
       TARGET_REPO: ${{ matrix.repo.repo }}
       MAX_ALERTS: ${{ inputs.max_alerts_per_repo || '300' }}
@@ -313,6 +346,7 @@ jobs:
         with:
           path: actions-repo
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Checkout target repository
         uses: actions/checkout@v4
