@@ -46,16 +46,37 @@ jobs:
     outputs:
       repos: ${{ steps.set-repos.outputs.repos }}
     steps:
+      - name: Set up token
+        id: token-setup
+        run: |
+          # Use PAT secret if available, otherwise use GITHUB_TOKEN
+          if [ -n "${PAT_TOKEN}" ] && [ "${PAT_TOKEN}" != "" ]; then
+            echo "🔑 Using Personal Access Token (PAT) from secret"
+            echo "token=${PAT_TOKEN}" >> $GITHUB_OUTPUT
+            TOKEN_TYPE="PAT"
+          else
+            echo "🔑 Using GITHUB_TOKEN (limited to current repository)"
+            echo "⚠️  Note: GITHUB_TOKEN can only access the current repository."
+            echo "⚠️  To access other repositories, create a secret named 'PAT_TOKEN' with a Personal Access Token."
+            echo "token=${GITHUB_TOKEN}" >> $GITHUB_OUTPUT
+            TOKEN_TYPE="GITHUB_TOKEN"
+          fi
+          echo "token_type=${TOKEN_TYPE}" >> $GITHUB_OUTPUT
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
       - name: Install dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq curl
 
       - name: Verify GitHub token
+        env:
+          TOKEN: ${{ steps.token-setup.outputs.token }}
         run: |
           echo "🔐 Verifying GitHub token..."
           response=$(curl -s -w "\n%{http_code}" \
-            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Authorization: Bearer ${TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/user")
@@ -65,7 +86,7 @@ jobs:
           
           if [ "${http_code}" = "200" ]; then
             username=$(echo "${body}" | jq -r '.login // "unknown"' 2>/dev/null || echo "unknown")
-            echo "✅ GitHub token is valid (authenticated as: ${username})"
+            echo "✅ GitHub token is valid (authenticated as: ${username}, type: ${{ steps.token-setup.outputs.token_type }})"
           else
             echo "⚠️ Warning: Token verification returned HTTP ${http_code}"
             echo "Response body: ${body}"
@@ -78,6 +99,7 @@ jobs:
           ORG_NAME: ${{ inputs.org_name || github.repository_owner }}
           MAX_REPOS: ${{ inputs.max_repos || '-1' }}
           USE_TEST_REPOS: ${{ inputs.use_test_repos != false && 'true' || 'false' }}
+          GITHUB_TOKEN: ${{ steps.token-setup.outputs.token }}
         run: |
           # Hardcoded list of repositories
           ORG_PREFIX="${ORG_NAME}/"
@@ -134,6 +156,12 @@ jobs:
               
               if [ "${repo_check_code}" = "200" ]; then
                 echo "✅ Repository ${repo} found."
+              elif [ "${repo_check_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) for ${repo}"
+                echo "   This usually means GITHUB_TOKEN cannot access other repositories."
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo}"
+                continue
               elif [ "${repo_check_code}" = "404" ]; then
                 echo "⚠️ Repository ${repo} not found or no access, skipping. Response body: ${repo_check_body}"
                 continue
@@ -154,6 +182,11 @@ jobs:
 
               if [ "${code_scanning_status_code}" = "403" ]; then
                 echo "⚠️ Code scanning is not enabled for ${repo} or token lacks 'security_events:read' permission, skipping. Response body: ${code_scanning_status_body}"
+                continue
+              elif [ "${code_scanning_status_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) when checking code scanning for ${repo}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo}"
                 continue
               elif [ "${code_scanning_status_code}" != "200" ]; then
                 echo "⚠️ Error checking code scanning status for ${repo}: HTTP ${code_scanning_status_code}, skipping. Response body: ${code_scanning_status_body}"
@@ -197,6 +230,12 @@ jobs:
               -H "X-GitHub-Api-Version: 2022-11-28" \
               "https://api.github.com/orgs/${ORG_NAME}/repos?type=all&page=${page}&per_page=100&sort=updated")
             
+            if [ "$(echo "${response}" | tail -n1)" = "401" ]; then
+              echo "❌ Authentication failed (HTTP 401) when listing organization repositories"
+              echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' scope via the 'github_token' input."
+              break
+            fi
+            
             http_code=$(echo "${response}" | tail -n1)
             body=$(echo "${response}" | head -n-1)
             
@@ -231,6 +270,11 @@ jobs:
               
               if [ "${repo_check_code}" = "200" ]; then
                 echo "✅ Repository ${repo_full_name} found."
+              elif [ "${repo_check_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) for ${repo_full_name}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo_full_name}"
+                continue
               elif [ "${repo_check_code}" = "404" ]; then
                 echo "⚠️ Repository ${repo_full_name} not found or no access, skipping. Response body: ${repo_check_body}"
                 continue
@@ -251,6 +295,11 @@ jobs:
 
               if [ "${code_scanning_status_code}" = "403" ]; then
                 echo "⚠️ Code scanning is not enabled for ${repo_full_name} or token lacks 'security_events:read' permission, skipping. Response body: ${code_scanning_status_body}"
+                continue
+              elif [ "${code_scanning_status_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) when checking code scanning for ${repo_full_name}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo_full_name}"
                 continue
               elif [ "${code_scanning_status_code}" != "200" ]; then
                 echo "⚠️ Error checking code scanning status for ${repo_full_name}: HTTP ${code_scanning_status_code}, skipping. Response body: ${code_scanning_status_body}"
@@ -336,12 +385,26 @@ jobs:
           echo "repo=${REPO}" >> $GITHUB_OUTPUT
           echo "📂 Processing: ${OWNER}/${REPO}"
 
+      - name: Set up token for triage
+        id: token-triage
+        run: |
+          # Use PAT secret if available, otherwise use GITHUB_TOKEN
+          if [ -n "${PAT_TOKEN}" ] && [ "${PAT_TOKEN}" != "" ]; then
+            echo "🔑 Using Personal Access Token (PAT) from secret for triage"
+            echo "token=${PAT_TOKEN}" >> $GITHUB_OUTPUT
+          else
+            echo "🔑 Using GITHUB_TOKEN for triage"
+            echo "token=${GITHUB_TOKEN}" >> $GITHUB_OUTPUT
+          fi
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
       - name: Checkout central actions repository
         uses: actions/checkout@v4
         with:
           path: actions-repo
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.token-triage.outputs.token }}
 
       - name: Checkout target repository
         uses: actions/checkout@v4
@@ -349,7 +412,7 @@ jobs:
           repository: ${{ matrix.repo.repo }}
           path: target-repo
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.token-triage.outputs.token }}
 
       - name: Install dependencies
         run: |
@@ -384,7 +447,7 @@ jobs:
         env:
           OWNER: ${{ steps.parse-repo.outputs.owner }}
           REPO: ${{ steps.parse-repo.outputs.repo }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.token-triage.outputs.token }}
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           CURSOR_MODEL: "auto"
           ALERT_STATE: "open"
