@@ -343,6 +343,13 @@ analyze_single_alert() {
     # Create context-aware prompt
     local prompt="You are a security expert with COMPLETE understanding of this repository.
 
+**IMPORTANT CONTEXT:**
+CodeQL static analysis often produces false positives. Many alerts are NOT real vulnerabilities due to:
+- Framework-level protections (ORM, template auto-escaping, etc.)
+- Architecture constraints (containerization, read-only filesystems, etc.)
+- Authentication models that make certain vulnerability classes irrelevant
+- Code paths that are not actually reachable or exploitable
+
 **REPOSITORY SECURITY PROFILE:**
 ${security_profile}
 
@@ -354,15 +361,22 @@ ${security_profile}
 - Message: ${message}
 
 **ANALYSIS TASK:**
-Given your complete understanding of this repository's architecture, security controls, and context, determine if this CodeQL alert represents a real security vulnerability.
+Given your complete understanding of this repository's architecture, security controls, and context, classify this CodeQL alert:
+
+- **FP (False Positive)**: The alert is NOT a real vulnerability due to framework protections, architecture, or other mitigating factors
+- **TP (True Positive)**: This is a REAL, exploitable security vulnerability that needs to be fixed
+- **UNCERTAIN**: Cannot determine with confidence - needs manual review
+
+**Be conservative and consider false positives first.** Only classify as TP if you are confident this is a real, exploitable vulnerability.
 
 **Consider:**
 1. Does the repository's authentication model make this vulnerability class irrelevant? (e.g., CSRF in JWT-only APIs)
-2. Do framework-level protections mitigate this issue? (e.g., ORM preventing SQL injection)
+2. Do framework-level protections mitigate this issue? (e.g., ORM preventing SQL injection, template auto-escaping preventing XSS)
 3. Is this code path actually reachable and exploitable given the application architecture?
 4. Are there security controls in place that CodeQL might not detect?
+5. Is this a test file, example code, or dead code that's not in production?
 
-**RESPOND WITH ONLY THIS JSON:**
+**RESPOND WITH ONLY THIS JSON (no markdown, no code fences, just the JSON object):**
 {
   \"classification\": \"TP|FP|UNCERTAIN\",
   \"certainty\": <0-100>,
@@ -373,10 +387,13 @@ Given your complete understanding of this repository's architecture, security co
 }
 
 **Examples of context-aware reasoning:**
-- \"FP: CSRF alert in JWT-authenticated API - no session cookies used, CSRF not applicable\"
-- \"FP: SQL injection in Django ORM query - parameterized queries used automatically\"  
-- \"TP: XSS in template that bypasses framework auto-escaping using |safe filter\"
-- \"FP: Path traversal in containerized environment with read-only filesystem\""
+- **FP**: CSRF alert in JWT-authenticated API - no session cookies used, CSRF not applicable
+- **FP**: SQL injection in Django ORM query - parameterized queries used automatically  
+- **FP**: Path traversal in containerized environment with read-only filesystem
+- **FP**: XSS in React component - React automatically escapes user input
+- **TP**: XSS in template that bypasses framework auto-escaping using |safe filter
+- **TP**: SQL injection in raw SQL query with string concatenation
+- **UNCERTAIN**: Complex control flow makes exploitability unclear"
     
     # Get AI analysis
     local ai_response
@@ -393,7 +410,19 @@ Given your complete understanding of this repository's architecture, security co
     local parsed
     if parsed=$(parse_json_response "${ai_response}" 2>/dev/null); then
         local classification=$(echo "${parsed}" | jq -r '.classification // "UNCERTAIN"')
+        # Normalize classification to uppercase and validate
+        classification=$(echo "${classification}" | tr '[:lower:]' '[:upper:]')
+        if [[ ! "${classification}" =~ ^(TP|FP|UNCERTAIN)$ ]]; then
+            log_warning "Invalid classification '${classification}', defaulting to UNCERTAIN" >&2
+            classification="UNCERTAIN"
+        fi
+        
         local certainty=$(echo "${parsed}" | jq -r '.certainty // 30')
+        # Ensure certainty is a number between 0-100
+        if ! [[ "${certainty}" =~ ^[0-9]+$ ]] || [ "${certainty}" -lt 0 ] || [ "${certainty}" -gt 100 ]; then
+            certainty=30
+        fi
+        
         local rationale=$(echo "${parsed}" | jq -r '.rationale // "Could not parse AI response"' | head -c 1500)
         # Ensure context_factors is always valid JSON array
         local context_factors=$(echo "${parsed}" | jq -c '.repository_context_factors // []' 2>/dev/null || echo "[]")
@@ -405,6 +434,10 @@ Given your complete understanding of this repository's architecture, security co
         local fix_suggestion=$(echo "${parsed}" | jq -r '.fix_suggestion // "Manual review required"' | head -c 500)
     else
         # Fallback for unparseable responses
+        log_warning "Failed to parse AI response, defaulting to UNCERTAIN" >&2
+        if [ "${DEBUG:-false}" = "true" ]; then
+            log_info "Raw AI response (first 500 chars): $(echo "${ai_response}" | head -c 500)" >&2
+        fi
         classification="UNCERTAIN"
         certainty=30
         rationale="Could not parse AI response"
