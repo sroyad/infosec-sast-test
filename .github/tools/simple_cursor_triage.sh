@@ -448,17 +448,25 @@ Given your complete understanding of this repository's architecture, security co
                 dismiss_response=$(curl -s -w "\n%{http_code}" -X PATCH \
                     -H "Authorization: Bearer ${GH_TOKEN}" \
                     -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2022-11-28" \
                     "${dismiss_url}" \
                     -d "{\"state\":\"dismissed\",\"dismissed_reason\":\"false positive\",\"dismissed_comment\":\"context-aware AI analysis\"}" \
                     --max-time 60)
                 
                 dismiss_code=$(echo "${dismiss_response}" | tail -n1)
+                dismiss_body=$(echo "${dismiss_response}" | head -n-1)
                 
                 if [ "${dismiss_code}" = "200" ] || [ "${dismiss_code}" = "201" ]; then
                     dismissed=true
-                    log_success "Auto-dismissed: true" >&2
+                    log_success "Auto-dismissed alert #${alert_number}: true" >&2
                 else
-                    log_warning "Dismiss failed: HTTP ${dismiss_code}" >&2
+                    log_warning "Dismiss failed for alert #${alert_number}: HTTP ${dismiss_code}" >&2
+                    log_warning "Response: ${dismiss_body}" >&2
+                    if [ "${dismiss_code}" = "403" ]; then
+                        log_error "Permission denied. Token may lack 'security-events:write' permission." >&2
+                    elif [ "${dismiss_code}" = "401" ]; then
+                        log_error "Authentication failed. Check token permissions." >&2
+                    fi
                 fi
             fi
         fi

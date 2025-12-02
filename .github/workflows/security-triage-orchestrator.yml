@@ -120,6 +120,7 @@ jobs:
           
           # TEST REPOS (for personal account testing)
           TEST_REPOS=(
+            "${ORG_PREFIX}infosec-sast-test"
             "${ORG_PREFIX}Lang-Detailed-Breakdown-Percent"
             "${ORG_PREFIX}test-repo-secret"
             "${ORG_PREFIX}demo-repo2"
