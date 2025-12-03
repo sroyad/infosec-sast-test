@@ -24,10 +24,10 @@ on:
         type: string
         default: ''
       use_test_repos:
-        description: 'Use hardcoded test repos list instead of discovery (true/false)'
+        description: 'Use hardcoded repos list instead of discovery (true/false)'
         required: false
         type: boolean
-        default: true  # Default to true to use hardcoded test repos
+        default: true  # Default to true to use hardcoded repos list
   schedule:
     - cron: "0 12 * * 0"  # Sundays 12:00 PM UTC
 
@@ -104,32 +104,32 @@ jobs:
           # Hardcoded list of repositories
           ORG_PREFIX="${ORG_NAME}/"
           
-          # PROD REPOS (commented out for testing)
-          # TEST_REPOS=(
-          #   "${ORG_PREFIX}payment-methods-ui"
-          #   "${ORG_PREFIX}subscription-ui"
-          #   "${ORG_PREFIX}billing-pricebook-microui"
-          #   "${ORG_PREFIX}prm-opportunities-ui"
-          #   "${ORG_PREFIX}product-ui"
-          #   "${ORG_PREFIX}authz"
-          #   "${ORG_PREFIX}reporting-service"
-          #   "${ORG_PREFIX}ad-checkout-ui"
-          #   "${ORG_PREFIX}revenue-shares-ui"
-          #   "${ORG_PREFIX}pricing"
-          # )
-          
-          # TEST REPOS (for personal account testing)
+          # PRODUCTION REPOS (for POC - update this list as needed)
           TEST_REPOS=(
-            "${ORG_PREFIX}infosec-sast-test"
-            "${ORG_PREFIX}Lang-Detailed-Breakdown-Percent"
-            "${ORG_PREFIX}test-repo-secret"
-            "${ORG_PREFIX}demo-repo2"
-            "${ORG_PREFIX}demo-repo1"
-            "${ORG_PREFIX}python-codeql-fresh"
-            "${ORG_PREFIX}python-codeql-demo"
-            "${ORG_PREFIX}test-codeql-optimization"
-            "${ORG_PREFIX}actions"
+            "${ORG_PREFIX}payment-methods-ui"
+            "${ORG_PREFIX}subscription-ui"
+            "${ORG_PREFIX}billing-pricebook-microui"
+            "${ORG_PREFIX}prm-opportunities-ui"
+            "${ORG_PREFIX}product-ui"
+            "${ORG_PREFIX}authz"
+            "${ORG_PREFIX}reporting-service"
+            "${ORG_PREFIX}ad-checkout-ui"
+            "${ORG_PREFIX}revenue-shares-ui"
+            "${ORG_PREFIX}pricing"
           )
+          
+          # TEST REPOS (commented out - uncomment for testing)
+          # TEST_REPOS=(
+          #   "${ORG_PREFIX}infosec-sast-test"
+          #   "${ORG_PREFIX}Lang-Detailed-Breakdown-Percent"
+          #   "${ORG_PREFIX}test-repo-secret"
+          #   "${ORG_PREFIX}demo-repo2"
+          #   "${ORG_PREFIX}demo-repo1"
+          #   "${ORG_PREFIX}python-codeql-fresh"
+          #   "${ORG_PREFIX}python-codeql-demo"
+          #   "${ORG_PREFIX}test-codeql-optimization"
+          #   "${ORG_PREFIX}actions"
+          # )
           
           echo "🔍 Discovering repositories with open CodeQL alerts in org: ${ORG_NAME}"
           
