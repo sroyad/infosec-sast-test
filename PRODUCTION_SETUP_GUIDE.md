@@ -5,10 +5,10 @@
 ```
 AppDirect/SecurityUtils/
 ├── .github/
-│   ├── workflows/
-│   │   └── security-triage-orchestrator.yml
-│   └── tools/
-│       └── simple_cursor_triage.sh
+│   └── workflows/
+│       └── security-triage-orchestrator.yml
+└── scripts/
+    └── simple_cursor_triage.sh
 ```
 
 ## Step 1: Create GitHub Personal Access Token (PAT)

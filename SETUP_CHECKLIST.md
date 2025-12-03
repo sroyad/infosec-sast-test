@@ -5,14 +5,14 @@
 ### 1. Repository Setup
 - [ ] Create/verify `AppDirect/SecurityUtils` repository exists
 - [ ] Upload `security-triage-orchestrator.yml` to `.github/workflows/`
-- [ ] Upload `simple_cursor_triage.sh` to `.github/tools/`
+- [ ] Upload `simple_cursor_triage.sh` to `scripts/`
 - [ ] Verify file structure matches:
   ```
   .github/
-  ├── workflows/
-  │   └── security-triage-orchestrator.yml
-  └── tools/
-      └── simple_cursor_triage.sh
+  └── workflows/
+      └── security-triage-orchestrator.yml
+  scripts/
+  └── simple_cursor_triage.sh
   ```
 
 ### 2. GitHub Personal Access Token (PAT)

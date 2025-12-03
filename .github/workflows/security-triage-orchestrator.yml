@@ -437,13 +437,13 @@ jobs:
 
       - name: Verify and prepare triage script
         run: |
-          # Script is in the same repo as the workflow (automatically checked out by GitHub Actions)
-          SCRIPT_PATH=".github/tools/simple_cursor_triage.sh"
+          # Script is in the scripts/ directory of the SecurityUtils repo
+          SCRIPT_PATH="scripts/simple_cursor_triage.sh"
           if [ ! -f "${SCRIPT_PATH}" ]; then
             echo "❌ Triage script not found at ${SCRIPT_PATH}"
             echo "📂 Current directory: $(pwd)"
-            echo "📂 Available files in .github/tools/:"
-            ls -la .github/tools/ || echo "Directory does not exist"
+            echo "📂 Available files in scripts/:"
+            ls -la scripts/ || echo "Directory does not exist"
             exit 1
           fi
           chmod +x "${SCRIPT_PATH}"
@@ -466,9 +466,9 @@ jobs:
           echo "📊 Alert count: ${{ matrix.repo.alert_count }}"
           echo "📂 Working directory: $(pwd)"
           
-          # Script is in the workspace root (same repo as workflow)
-          # From target-repo, go up one level to workspace root
-          SCRIPT_PATH="../.github/tools/simple_cursor_triage.sh"
+          # Script is in the scripts/ directory of the SecurityUtils repo
+          # From target-repo, go up one level to workspace root, then to scripts/
+          SCRIPT_PATH="../scripts/simple_cursor_triage.sh"
           
           # Verify script exists before running
           if [ ! -f "${SCRIPT_PATH}" ]; then
