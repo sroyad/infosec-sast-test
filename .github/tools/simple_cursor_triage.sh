@@ -354,38 +354,15 @@ ${security_profile}
 - Message: ${message}
 
 **ANALYSIS TASK:**
-Classify this CodeQL alert based on the repository context:
+Given your complete understanding of this repository's architecture, security controls, and context, determine if this CodeQL alert represents a real security vulnerability.
 
-**Classification Guidelines:**
-- **FP (False Positive)**: Classify as FP if the alert is NOT a real vulnerability due to:
-  * Framework-level protections (ORM parameterization, template auto-escaping, etc.)
-  * Architecture constraints (containerization, read-only filesystems, etc.)
-  * Authentication models that make the vulnerability class irrelevant (e.g., CSRF in JWT-only APIs)
-  * Code paths that are not reachable or exploitable
-  * Test files, example code, or dead code
-  * Use FP when you can confidently identify why this is NOT exploitable (certainty >= 70)
+**Consider:**
+1. Does the repository's authentication model make this vulnerability class irrelevant? (e.g., CSRF in JWT-only APIs)
+2. Do framework-level protections mitigate this issue? (e.g., ORM preventing SQL injection)
+3. Is this code path actually reachable and exploitable given the application architecture?
+4. Are there security controls in place that CodeQL might not detect?
 
-- **TP (True Positive)**: Classify as TP only if this is a REAL, exploitable security vulnerability:
-  * The vulnerability can actually be exploited in the current architecture
-  * Framework protections do NOT mitigate this issue
-  * The code path is reachable and exploitable
-  * Use TP when you are confident this needs to be fixed (certainty >= 70)
-
-- **UNCERTAIN**: Use only when you genuinely cannot determine with reasonable confidence:
-  * Complex control flow makes exploitability unclear
-  * Insufficient context to make a determination
-  * Use UNCERTAIN sparingly - prefer FP or TP when you have enough information
-
-**Key Principle: CodeQL often produces false positives (typically 40-70% of alerts). Your goal is to identify false positives confidently. When you can identify clear mitigating factors (framework protections, architecture constraints, etc.), classify as FP with high certainty. Only use UNCERTAIN when you genuinely cannot determine due to lack of information.**
-
-**Consider these factors:**
-1. Framework protections: Does the framework/library automatically prevent this vulnerability?
-2. Architecture: Does the deployment architecture mitigate this (e.g., read-only filesystem, containerization)?
-3. Authentication: Does the auth model make this vulnerability class irrelevant?
-4. Reachability: Is this code path actually reachable and exploitable?
-5. Context: Is this test code, example code, or production code?
-
-**RESPOND WITH ONLY THIS JSON (no markdown, no code fences, just the JSON object):**
+**RESPOND WITH ONLY THIS JSON:**
 {
   \"classification\": \"TP|FP|UNCERTAIN\",
   \"certainty\": <0-100>,
@@ -395,14 +372,11 @@ Classify this CodeQL alert based on the repository context:
   \"fix_suggestion\": \"<recommendation or 'not applicable'>\"
 }
 
-**Classification Examples:**
-- **FP (certainty: 85)**: CSRF alert in JWT-authenticated API - no session cookies used, CSRF not applicable
-- **FP (certainty: 90)**: SQL injection in Django ORM query - Django ORM uses parameterized queries automatically
-- **FP (certainty: 80)**: XSS in React component - React automatically escapes user input in JSX
-- **FP (certainty: 75)**: Path traversal in containerized environment with read-only filesystem
-- **TP (certainty: 85)**: XSS in template using |safe filter that bypasses framework auto-escaping
-- **TP (certainty: 90)**: SQL injection in raw SQL query with string concatenation, no parameterization
-- **UNCERTAIN (certainty: 40)**: Complex control flow with multiple conditional branches makes exploitability unclear without runtime analysis"
+**Examples of context-aware reasoning:**
+- \"FP: CSRF alert in JWT-authenticated API - no session cookies used, CSRF not applicable\"
+- \"FP: SQL injection in Django ORM query - parameterized queries used automatically\"  
+- \"TP: XSS in template that bypasses framework auto-escaping using |safe filter\"
+- \"FP: Path traversal in containerized environment with read-only filesystem\""
     
     # Get AI analysis
     local ai_response
