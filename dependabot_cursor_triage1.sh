@@ -29,9 +29,6 @@ ALLOW_PHASE1_FALLBACK="${ALLOW_PHASE1_FALLBACK:-false}"
 ALERT_STATE="${ALERT_STATE:-open}"
 MAX_ALERTS="${MAX_ALERTS:-300}"
 AUTO_DISMISS="${AUTO_DISMISS:-false}"
-# Minimum AI certainty (0-100) to PATCH-dismiss a false positive when AUTO_DISMISS=true.
-# Previously the script required certainty>=70 AND medium/high confidence, which blocked most FPs.
-AUTO_DISMISS_MIN_CERTAINTY="${AUTO_DISMISS_MIN_CERTAINTY:-0}"
 SUMMARY_PATH="${GITHUB_STEP_SUMMARY:-}"
 
 # Temporary files
@@ -39,8 +36,6 @@ TEMP_DIR=$(mktemp -d)
 ALERTS_FILE="${TEMP_DIR}/alerts.json"
 DEPENDENCY_PROFILE_FILE="repository_dependency_profile.txt"
 RESULTS_FILE="dependabot-triage-results.json"
-# Written alongside RESULTS_FILE: rollup counts for job summary / dashboards
-SUMMARY_STATS_FILE="dependabot-triage-summary.json"
 
 trap 'rm -rf "${TEMP_DIR}"' EXIT
 
@@ -676,64 +671,41 @@ Given your complete understanding of this repository's dependency usage, determi
     # Build result JSON
     local dismissed=false
     
-    # Auto-dismiss: PATCH GitHub Dependabot alert (requires security-events:write on the token).
-    # Dismiss when classified FP and certainty meets minimum (default 0). Do not require
-    # separate "confidence band" — that previously blocked almost all dismissals (needed certainty>=70 AND medium/high).
-    local min_cert="${AUTO_DISMISS_MIN_CERTAINTY}"
-    if ! [[ "${min_cert}" =~ ^[0-9]+$ ]] || [ "${min_cert}" -lt 0 ] || [ "${min_cert}" -gt 100 ]; then
-        min_cert=0
-    fi
-
+    # Auto-dismiss if configured (matching Python logic exactly)
     if [ "${AUTO_DISMISS}" = "true" ] && [ "${ai_label}" = "likely_false_positive" ]; then
-        if [ "${certainty}" -lt "${min_cert}" ]; then
-            log_info "Auto-dismiss skipped for alert #${alert_number}: FP but certainty ${certainty}% < minimum ${min_cert}% (set AUTO_DISMISS_MIN_CERTAINTY to lower)" >&2
-        else
-            log_info "Attempting auto-dismiss for alert #${alert_number} (FP, certainty ${certainty}% >= ${min_cert}%)..." >&2
-
-            local dismiss_url="https://api.github.com/repos/${OWNER}/${REPO}/dependabot/alerts/${alert_number}"
-            local dismiss_payload
-            dismiss_payload=$(jq -n \
-                --arg comment "Context-aware AI analysis: ${rationale}" \
-                '{state: "dismissed", dismissed_reason: "inaccurate", dismissed_comment: $comment}' \
-                2>/dev/null) || dismiss_payload=""
-
-            if [ -z "${dismiss_payload}" ]; then
-                log_warning "Could not build dismiss JSON for alert #${alert_number}; skipping" >&2
-            else
+        if [ "${confidence}" = "high" ] || [ "${confidence}" = "medium" ]; then
+            if [ "${certainty}" -ge 70 ]; then
+                log_info "Attempting auto-dismiss..." >&2
+                
+                local dismiss_url="https://api.github.com/repos/${OWNER}/${REPO}/dependabot/alerts/${alert_number}"
                 local dismiss_response
                 local dismiss_code
-                local dismiss_body
-
+                
                 dismiss_response=$(curl -s -w "\n%{http_code}" -X PATCH \
                     -H "Authorization: Bearer ${GH_TOKEN}" \
                     -H "Accept: application/vnd.github+json" \
                     -H "X-GitHub-Api-Version: 2022-11-28" \
-                    -H "Content-Type: application/json" \
                     "${dismiss_url}" \
-                    -d "${dismiss_payload}" \
+                    -d "{\"state\":\"dismissed\",\"dismissed_reason\":\"false_positive\",\"dismissed_comment\":\"Context-aware AI analysis: ${rationale}\"}" \
                     --max-time 60)
-
+                
                 dismiss_code=$(echo "${dismiss_response}" | tail -n1)
                 dismiss_body=$(echo "${dismiss_response}" | head -n-1)
-
-                if [ "${dismiss_code}" = "200" ] || [ "${dismiss_code}" = "204" ]; then
+                
+                if [ "${dismiss_code}" = "200" ] || [ "${dismiss_code}" = "201" ]; then
                     dismissed=true
-                    log_success "Auto-dismissed Dependabot alert #${alert_number}" >&2
+                    log_success "Auto-dismissed alert #${alert_number}" >&2
                 else
                     log_warning "Dismiss failed for alert #${alert_number}: HTTP ${dismiss_code}" >&2
                     log_warning "Response: ${dismiss_body}" >&2
                     if [ "${dismiss_code}" = "403" ]; then
-                        log_error "Permission denied. Token needs Dependabot alert write access on ${OWNER}/${REPO} (security-events:write; PAT may need repo scope + org SSO if applicable)." >&2
+                        log_error "Permission denied. Token may lack 'security-events:write' permission." >&2
                     elif [ "${dismiss_code}" = "401" ]; then
                         log_error "Authentication failed. Check token permissions." >&2
-                    elif [ "${dismiss_code}" = "404" ]; then
-                        log_error "Alert not found or token cannot see this repository's Dependabot alerts." >&2
                     fi
                 fi
             fi
         fi
-    elif [ "${AUTO_DISMISS}" = "true" ] && [ "${ai_label}" != "likely_false_positive" ]; then
-        : # not an FP — never auto-dismiss
     fi
     
     # Ensure certainty is a valid number
@@ -914,43 +886,18 @@ phase2_analyze_alerts() {
 
 generate_summary() {
     local results="$1"
-    local total_alerts_fetched="${2:-0}"
-
+    
     local total=$(echo "${results}" | jq 'length')
     local tp_count=$(echo "${results}" | jq '[.[] | select(.ai_label == "real_issue")] | length')
     local fp_count=$(echo "${results}" | jq '[.[] | select(.ai_label == "likely_false_positive")] | length')
     local uncertain_count=$(echo "${results}" | jq '[.[] | select(.ai_label == "needs_review")] | length')
     local dismissed_count=$(echo "${results}" | jq '[.[] | select(.dismissed == true)] | length')
-
-    # Machine-readable rollup (same directory as dependabot-triage-results.json)
-    jq -n \
-        --arg owner "${OWNER}" \
-        --arg repo "${REPO}" \
-        --argjson fetched "${total_alerts_fetched}" \
-        --argjson analyzed "${total}" \
-        --argjson tp "${tp_count}" \
-        --argjson fp "${fp_count}" \
-        --argjson uncertain "${uncertain_count}" \
-        --argjson dismissed "${dismissed_count}" \
-        '{
-            repository: ($owner + "/" + $repo),
-            total_alerts_fetched: $fetched,
-            alerts_analyzed: $analyzed,
-            true_positives: $tp,
-            false_positives_detected: $fp,
-            needs_review: $uncertain,
-            dismissed_via_api: $dismissed
-        }' > "${SUMMARY_STATS_FILE}" 2>/dev/null || true
-
+    
     echo ""
     log_phase "🎉 TRIAGE COMPLETE!"
-    echo "📬 Dependabot alerts fetched (open): ${total_alerts_fetched}"
-    echo "📊 Analyzed end-to-end: ${total} | TP: ${tp_count} | FP (detected): ${fp_count} | Review: ${uncertain_count}"
-    log_success "Dismissed via GitHub API (false positives): ${dismissed_count}"
-    if [ "${total_alerts_fetched}" -gt 0 ] && [ "${total}" -lt "${total_alerts_fetched}" ]; then
-        log_warning "$((total_alerts_fetched - total)) alert(s) were not fully analyzed (see job log)."
-    fi
-
+    echo "📊 Total: ${total} | TP: ${tp_count} | FP: ${fp_count} | Review: ${uncertain_count}"
+    log_success "Auto-dismissed: ${dismissed_count}"
+    
     # Generate markdown summary for GitHub Actions
     if [ -n "${SUMMARY_PATH}" ]; then
         {
@@ -961,24 +908,12 @@ generate_summary() {
             echo "**Analysis Approach:** Two-phase (Dependency Usage Analysis → Alert Analysis)"
             echo ""
             echo "## 📊 Summary"
+            echo "- **Total Alerts Processed:** ${total}"
+            echo "- **True Positives:** ${tp_count} (require attention)"
+            echo "- **False Positives:** ${fp_count} (context-aware dismissal)"
+            echo "- **Needs Review:** ${uncertain_count} (uncertain cases)"
+            echo "- **Auto-dismissed:** ${dismissed_count}"
             echo ""
-            echo "| Metric | Count |"
-            echo "|--------|------:|"
-            echo "| **Total Dependabot alerts (open, fetched)** | ${total_alerts_fetched} |"
-            echo "| **Alerts analyzed end-to-end** | ${total} |"
-            echo "| **True positives (real issues)** | ${tp_count} |"
-            echo "| **False positives (AI-detected)** | ${fp_count} |"
-            echo "| **Needs review (uncertain)** | ${uncertain_count} |"
-            echo "| **Dismissed via API** (PATCH succeeded) | ${dismissed_count} |"
-            echo ""
-            if [ "${fp_count}" -gt 0 ] && [ "${dismissed_count}" -lt "${fp_count}" ]; then
-                echo "> **Note:** Some false positives were not dismissed (below certainty threshold, AUTO_DISMISS off, or API error). Check logs."
-                echo ""
-            fi
-            if [ "${total_alerts_fetched}" -gt 0 ] && [ "${total}" -lt "${total_alerts_fetched}" ]; then
-                echo "> **Note:** $((total_alerts_fetched - total)) alert(s) could not be fully analyzed."
-                echo ""
-            fi
             echo "## 📋 Detailed Results"
             echo ""
             echo "| Alert # | Dependency | Vulnerability | Severity | Manifest | Classification | Confidence | Certainty | Used? | Dismissed | Reasoning |"
@@ -1030,18 +965,16 @@ main() {
     
     if [ "${alert_count}" -eq 0 ]; then
         log_info "ℹ️  No Dependabot alerts found"
-        echo "[]" > "${RESULTS_FILE}"
-        generate_summary "[]" "0"
         return 0
     fi
-
+    
     # Phase 2: Analyze alerts with full context
     phase2_analyze_alerts "${dependency_profile}"
-
-    # Generate summary (total fetched = alerts in ALERTS_FILE before/during triage)
+    
+    # Generate summary
     local results
     results=$(cat "${RESULTS_FILE}")
-    generate_summary "${results}" "${alert_count}"
+    generate_summary "${results}"
     
     log_success "Context-aware Dependabot triage complete!"
 }
