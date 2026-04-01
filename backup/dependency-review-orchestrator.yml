@@ -1,0 +1,769 @@
+name: "Dependency Review Orchestrator"
+
+on:
+  workflow_dispatch:
+    inputs:
+      auto_dismiss:
+        description: 'Auto-dismiss false positives (true/false)'
+        required: false
+        type: boolean
+        default: false
+      max_alerts_per_repo:
+        description: 'Maximum Dependabot alerts to process per repository'
+        required: false
+        type: string
+        default: '300'
+      max_repos:
+        description: 'Maximum repositories to process (0 = all, -1 = use test_repos list)'
+        required: false
+        type: string
+        default: '-1'
+      org_name:
+        description: 'Organization name to scan (default: uses GITHUB_REPOSITORY_OWNER)'
+        required: false
+        type: string
+        default: ''
+      use_test_repos:
+        description: 'Use hardcoded repos list instead of discovery (true/false)'
+        required: false
+        type: boolean
+        default: true  # Default to true to use hardcoded repos list
+      cursor_model:
+        description: 'Cursor model passed to cursor-agent (use a concrete model if auto fails with provider errors)'
+        required: false
+        type: string
+        default: 'auto'
+      matrix_max_parallel:
+        description: 'Max parallel triage jobs (lower reduces Cursor API contention / resource_exhausted)'
+        required: false
+        type: number
+        default: 2
+      cursor_max_retries:
+        description: 'Retries per Cursor call (Phase 1 and each alert in Phase 2)'
+        required: false
+        type: number
+        default: 5
+      cursor_retry_delay_sec:
+        description: 'Initial backoff seconds between Cursor retries (doubles each attempt)'
+        required: false
+        type: number
+        default: 20
+      allow_phase1_fallback:
+        description: 'If Phase 1 AI fails after retries, continue with a minimal manifest-based profile (lower quality)'
+        required: false
+        type: boolean
+        default: false
+      auto_dismiss_min_certainty:
+        description: 'Minimum AI certainty (0-100) to PATCH-dismiss a false positive when auto_dismiss is true'
+        required: false
+        type: number
+        default: 0
+  schedule:
+    - cron: "0 14 * * 0"  # Sundays 2:00 PM UTC (different from CodeQL triage)
+
+permissions:
+  contents: read              # Read repository files
+  security-events: write      # Read/dismiss security alerts (write permission includes read)
+  actions: read              # Read workflow information
+
+jobs:
+  discover-repos-with-dependabot-alerts:
+    runs-on: appdirect-self-hosted-java-large-runner
+    permissions:
+      contents: read
+      security-events: read    # Need read permission to discover alerts
+      actions: read
+    outputs:
+      repos: ${{ steps.set-repos.outputs.repos }}
+    steps:
+      - name: Set up token
+        id: token-setup
+        run: |
+          # Use PAT secret if available, otherwise use GITHUB_TOKEN
+          if [ -n "${PAT_TOKEN}" ] && [ "${PAT_TOKEN}" != "" ]; then
+            echo "🔑 Using Personal Access Token (PAT) from secret"
+            echo "token=${PAT_TOKEN}" >> $GITHUB_OUTPUT
+            TOKEN_TYPE="PAT"
+          else
+            echo "🔑 Using GITHUB_TOKEN (limited to current repository)"
+            echo "⚠️  Note: GITHUB_TOKEN can only access the current repository."
+            echo "⚠️  To access other repositories, create a secret named 'PAT_TOKEN' with a Personal Access Token."
+            echo "token=${GITHUB_TOKEN}" >> $GITHUB_OUTPUT
+            TOKEN_TYPE="GITHUB_TOKEN"
+          fi
+          echo "token_type=${TOKEN_TYPE}" >> $GITHUB_OUTPUT
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl
+
+      - name: Verify GitHub token
+        env:
+          TOKEN: ${{ steps.token-setup.outputs.token }}
+        run: |
+          echo "🔐 Verifying GitHub token..."
+          response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/user")
+          
+          http_code=$(echo "${response}" | tail -n1)
+          body=$(echo "${response}" | head -n-1)
+          
+          if [ "${http_code}" = "200" ]; then
+            username=$(echo "${body}" | jq -r '.login // "unknown"' 2>/dev/null || echo "unknown")
+            echo "✅ GitHub token is valid (authenticated as: ${username}, type: ${{ steps.token-setup.outputs.token_type }})"
+          else
+            echo "⚠️ Warning: Token verification returned HTTP ${http_code}"
+            echo "Response body: ${body}"
+            echo "⚠️ Continuing anyway - actual API calls will validate the token"
+          fi
+
+      - name: Discover repositories with open Dependabot alerts
+        id: discover
+        env:
+          ORG_NAME: ${{ inputs.org_name || github.repository_owner }}
+          MAX_REPOS: ${{ inputs.max_repos || '-1' }}
+          USE_TEST_REPOS: ${{ inputs.use_test_repos == true && 'true' || 'false' }}
+          GITHUB_TOKEN: ${{ steps.token-setup.outputs.token }}
+        run: |
+          # Hardcoded list of repositories
+          ORG_PREFIX="${ORG_NAME}/"
+          
+          # ALLOWED REPOS (used for both hardcoded list and dynamic discovery whitelist)
+          ALLOWED_REPOS=(
+            "${ORG_PREFIX}account-portal-ux"
+            "${ORG_PREFIX}ad-checkout-settings"
+            "${ORG_PREFIX}ad-checkout-ui"
+            "${ORG_PREFIX}ad-terms"
+            "${ORG_PREFIX}ad-terms-ui"
+            "${ORG_PREFIX}admin-concierge-ui"
+            "${ORG_PREFIX}agent-commission-strategy"
+            "${ORG_PREFIX}apollo-gateway"
+            "${ORG_PREFIX}app-connector"
+            "${ORG_PREFIX}appbilling-api"
+            "${ORG_PREFIX}appdevices-landing-page"
+            "${ORG_PREFIX}AppDirect"
+            "${ORG_PREFIX}appdirect-pso-components"
+            "${ORG_PREFIX}appdistribution-landing-page"
+            "${ORG_PREFIX}appflow"
+            "${ORG_PREFIX}appidentity-landing-page"
+            "${ORG_PREFIX}appidentity-technical-documentation"
+            "${ORG_PREFIX}appinsights-connector-api"
+            "${ORG_PREFIX}appinsights-landing-page"
+            "${ORG_PREFIX}appinsights-venom"
+            "${ORG_PREFIX}appmarket-api-composition"
+            "${ORG_PREFIX}appmarket-landing-page"
+            "${ORG_PREFIX}appsearch-api"
+            "${ORG_PREFIX}appsmart-card"
+            "${ORG_PREFIX}appsmart-docs"
+            "${ORG_PREFIX}appsmart-office-quotes-service"
+            "${ORG_PREFIX}appsmart-office-react"
+            "${ORG_PREFIX}appsmart-office-ui"
+            "${ORG_PREFIX}appsmart-office-ui-quotes"
+            "${ORG_PREFIX}appwise-landing-page"
+            "${ORG_PREFIX}appwise-notify"
+            "${ORG_PREFIX}appwise-roster"
+            "${ORG_PREFIX}authn"
+            "${ORG_PREFIX}authz"
+            "${ORG_PREFIX}aws-connector"
+            "${ORG_PREFIX}billing-pricebook-microui"
+            "${ORG_PREFIX}catalog-curation-ui"
+            "${ORG_PREFIX}chat-widget"
+            "${ORG_PREFIX}cms-connector-atlassian"
+            "${ORG_PREFIX}cms-connector-document-processor"
+            "${ORG_PREFIX}cms-connector-google-processor"
+            "${ORG_PREFIX}cms-connector-mgmt"
+            "${ORG_PREFIX}cms-connector-slack"
+            "${ORG_PREFIX}cms-connector-slack-processor"
+            "${ORG_PREFIX}cms-connector-source"
+            "${ORG_PREFIX}cms-connector-ui"
+            "${ORG_PREFIX}commissions-processor-ui"
+            "${ORG_PREFIX}consent"
+            "${ORG_PREFIX}credit-memo-ui"
+            "${ORG_PREFIX}cx-api"
+            "${ORG_PREFIX}daf-connector"
+            "${ORG_PREFIX}developer-dashboard"
+            "${ORG_PREFIX}developer-docs-website"
+            "${ORG_PREFIX}disti-microui"
+            "${ORG_PREFIX}dts-api-customizer"
+            "${ORG_PREFIX}dts-ipaas"
+            "${ORG_PREFIX}dtsbilling-api-composition"
+            "${ORG_PREFIX}dtsmp-encipher"
+            "${ORG_PREFIX}file-management"
+            "${ORG_PREFIX}functions-ui"
+            "${ORG_PREFIX}gocardless-payment-connector"
+            "${ORG_PREFIX}google-connector"
+            "${ORG_PREFIX}google-renewal-ui"
+            "${ORG_PREFIX}google-transfer-micro-ui"
+            "${ORG_PREFIX}graphql-explorer"
+            "${ORG_PREFIX}graphql-explorer-demo"
+            "${ORG_PREFIX}graphql-explorer-middleware"
+            "${ORG_PREFIX}graphql-explorer-settings"
+            "${ORG_PREFIX}help-docs-website"
+            "${ORG_PREFIX}hermes"
+            "${ORG_PREFIX}hermes-backend"
+            "${ORG_PREFIX}hub-integration"
+            "${ORG_PREFIX}hub-sam"
+            "${ORG_PREFIX}iaas-runs-observability-ui"
+            "${ORG_PREFIX}iam-api"
+            "${ORG_PREFIX}image-library"
+            "${ORG_PREFIX}invoice-core"
+            "${ORG_PREFIX}invoice-dashboard"
+            "${ORG_PREFIX}itg"
+            "${ORG_PREFIX}itg-composition"
+            "${ORG_PREFIX}itg-html-generator"
+            "${ORG_PREFIX}itg-pdf-generator"
+            "${ORG_PREFIX}listing-fetcher"
+            "${ORG_PREFIX}locator-go"
+            "${ORG_PREFIX}locator-nextjs"
+            "${ORG_PREFIX}marketplace-accounts"
+            "${ORG_PREFIX}marketplace-bi"
+            "${ORG_PREFIX}marketplace-blimp"
+            "${ORG_PREFIX}marketplace-events"
+            "${ORG_PREFIX}marketplace-pricing-microui"
+            "${ORG_PREFIX}marketplace-users"
+            "${ORG_PREFIX}marketplace-zendesk"
+            "${ORG_PREFIX}mcc-micro-ui"
+            "${ORG_PREFIX}mercury"
+            "${ORG_PREFIX}metered-usage"
+            "${ORG_PREFIX}metered-usage-microui"
+            "${ORG_PREFIX}metrica"
+            "${ORG_PREFIX}micro-container"
+            "${ORG_PREFIX}micro-ui-report-center"
+            "${ORG_PREFIX}microsoft-connector"
+            "${ORG_PREFIX}msdp"
+            "${ORG_PREFIX}msft-inbound-connector"
+            "${ORG_PREFIX}msft-sku-service"
+            "${ORG_PREFIX}msft-ui"
+            "${ORG_PREFIX}navigation"
+            "${ORG_PREFIX}navigation-manager"
+            "${ORG_PREFIX}notification-relay"
+            "${ORG_PREFIX}orbipay-connector"
+            "${ORG_PREFIX}overdue-invoices-ui"
+            "${ORG_PREFIX}partial-refund-service"
+            "${ORG_PREFIX}payment-service"
+            "${ORG_PREFIX}personalization"
+            "${ORG_PREFIX}platform-manager"
+            "${ORG_PREFIX}pricing"
+            "${ORG_PREFIX}prm-opportunities-api-composition"
+            "${ORG_PREFIX}prm-purchase-setup"
+            "${ORG_PREFIX}prm-reseller-api"
+            "${ORG_PREFIX}product-management"
+            "${ORG_PREFIX}product-ui"
+            "${ORG_PREFIX}product-uploader-api"
+            "${ORG_PREFIX}product-uploader-ui"
+            "${ORG_PREFIX}product-variants-ui"
+            "${ORG_PREFIX}program-manager-ui"
+            "${ORG_PREFIX}psa-sync-micro-ui"
+            "${ORG_PREFIX}pts-helpdesk"
+            "${ORG_PREFIX}reconciliation-ui"
+            "${ORG_PREFIX}remote-approval"
+            "${ORG_PREFIX}reporting-service"
+            "${ORG_PREFIX}reseller-dashboard-ui"
+            "${ORG_PREFIX}revenue-shares"
+            "${ORG_PREFIX}revenue-shares-ui"
+            "${ORG_PREFIX}review-syndicator"
+            "${ORG_PREFIX}rpa-connector"
+            "${ORG_PREFIX}sfb-theme-components"
+            "${ORG_PREFIX}snappay-connector"
+            "${ORG_PREFIX}storefront-page-api"
+            "${ORG_PREFIX}storefront-web-server"
+            "${ORG_PREFIX}subscription"
+            "${ORG_PREFIX}subscription-ui"
+            "${ORG_PREFIX}subscription-update-composition"
+            "${ORG_PREFIX}subscriptions-tool-microui"
+            "${ORG_PREFIX}tax"
+            "${ORG_PREFIX}theme-manager"
+            "${ORG_PREFIX}toolkit-pwsh-server"
+            "${ORG_PREFIX}tps"
+            "${ORG_PREFIX}tpv-connector"
+            "${ORG_PREFIX}ucm"
+            "${ORG_PREFIX}ui-extensions-management"
+            "${ORG_PREFIX}universal-header"
+            "${ORG_PREFIX}usage-data-sink"
+            "${ORG_PREFIX}usage-mgmt"
+            "${ORG_PREFIX}webhooks-ui"
+            "${ORG_PREFIX}wmode-rubicon-sgw"
+            "${ORG_PREFIX}buyer-frontend"
+            "${ORG_PREFIX}manage"
+            "${ORG_PREFIX}builtfirst-api"
+            "${ORG_PREFIX}builtfirst-handlebars"
+            "${ORG_PREFIX}terraform"
+            "${ORG_PREFIX}terraform-modules"
+            "${ORG_PREFIX}ai-companion"
+            "${ORG_PREFIX}appdirect-ai-slack"
+            "${ORG_PREFIX}appdirect-ai-embeddable"
+            "${ORG_PREFIX}appdirect-ai-python-ace"
+            "${ORG_PREFIX}docs-devs-ai"
+            "${ORG_PREFIX}appdirect-ai-automation-tests"
+            "${ORG_PREFIX}jbilling"
+            "${ORG_PREFIX}jbilling-spc"
+            "${ORG_PREFIX}jbilling-soa"
+            "${ORG_PREFIX}jbilling-fc"
+            "${ORG_PREFIX}itcloud-robojournal"
+            "${ORG_PREFIX}itcloud-cyber-watchdog"
+            "${ORG_PREFIX}itcloud-acceo-platform"
+            "${ORG_PREFIX}itcloud-web-platform"
+            "${ORG_PREFIX}firstbase-app"
+            "${ORG_PREFIX}firstbase-assistant"
+            "${ORG_PREFIX}techweb-ui"
+            "${ORG_PREFIX}techweb"
+            "${ORG_PREFIX}cx-ex"
+            "${ORG_PREFIX}borg"
+          )
+          
+          # TEST REPOS (commented out - uncomment for testing)
+          # TEST_REPOS=(
+          #   "${ORG_PREFIX}infosec-sast-test"
+          #   "${ORG_PREFIX}Lang-Detailed-Breakdown-Percent"
+          #   "${ORG_PREFIX}test-repo-secret"
+          #   "${ORG_PREFIX}demo-repo2"
+          #   "${ORG_PREFIX}demo-repo1"
+          #   "${ORG_PREFIX}python-codeql-fresh"
+          #   "${ORG_PREFIX}python-codeql-demo"
+          #   "${ORG_PREFIX}test-codeql-optimization"
+          #   "${ORG_PREFIX}actions"
+          # )
+          
+          echo "🔍 Discovering repositories with open Dependabot alerts in org: ${ORG_NAME}"
+          
+          repos_json="[]"
+          
+          # Use hardcoded repos list ONLY if explicitly enabled
+          if [ "${USE_TEST_REPOS}" = "true" ]; then
+            echo "📋 Using hardcoded repositories list (from ALLOWED_REPOS)"
+            for repo in "${ALLOWED_REPOS[@]}"; do
+              if [ -z "${repo}" ] || [[ "${repo}" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              
+              echo "🔍 Checking ${repo} for open Dependabot alerts..."
+              # First, check if the repository exists and is accessible
+              repo_check_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo}")
+              
+              repo_check_code=$(echo "${repo_check_response}" | tail -n1)
+              repo_check_body=$(echo "${repo_check_response}" | head -n-1)
+              
+              if [ "${repo_check_code}" = "200" ]; then
+                echo "✅ Repository ${repo} found."
+              elif [ "${repo_check_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) for ${repo}"
+                echo "   This usually means GITHUB_TOKEN cannot access other repositories."
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo}"
+                continue
+              elif [ "${repo_check_code}" = "404" ]; then
+                echo "⚠️ Repository ${repo} not found or no access, skipping. Response body: ${repo_check_body}"
+                continue
+              else
+                echo "⚠️ Error checking repository ${repo} existence: HTTP ${repo_check_code}, skipping. Response body: ${repo_check_body}"
+                continue
+              fi
+
+              # Check if Dependabot alerts are enabled for the repo
+              dependabot_status_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo}/dependabot/alerts?per_page=1") # Just check if endpoint is accessible
+              
+              dependabot_status_code=$(echo "${dependabot_status_response}" | tail -n1)
+              dependabot_status_body=$(echo "${dependabot_status_response}" | head -n-1)
+
+              if [ "${dependabot_status_code}" = "403" ]; then
+                echo "⚠️ Dependabot alerts are not enabled for ${repo} or token lacks 'security_events:read' permission, skipping. Response body: ${dependabot_status_body}"
+                continue
+              elif [ "${dependabot_status_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) when checking Dependabot alerts for ${repo}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo}"
+                continue
+              elif [ "${dependabot_status_code}" != "200" ]; then
+                echo "⚠️ Error checking Dependabot alerts status for ${repo}: HTTP ${dependabot_status_code}, skipping. Response body: ${dependabot_status_body}"
+                continue
+              fi
+              
+              # Check if repo has open Dependabot alerts
+              alerts_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo}/dependabot/alerts?state=open&per_page=100")
+              
+              alerts_code=$(echo "${alerts_response}" | tail -n1)
+              alerts_body=$(echo "${alerts_response}" | head -n-1)
+              
+              if [ "${alerts_code}" = "200" ]; then
+                actual_count=$(echo "${alerts_body}" | jq 'if type == "array" then length else 0 end' || echo "0")
+                
+                if [ "${actual_count}" -gt 0 ]; then
+                  echo "✅ Found ${actual_count} open Dependabot alerts in ${repo}"
+                  repos_json=$(echo "${repos_json}" | jq --arg repo "${repo}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
+                else
+                  echo "ℹ️  No open Dependabot alerts from Dependabot in ${repo}, skipping. Response body: ${alerts_body}"
+                fi
+              else
+                echo "⚠️  Error fetching Dependabot alerts for ${repo}: HTTP ${alerts_code}, skipping. Response body: ${alerts_body}"
+              fi
+            done
+          else
+            # Dynamic discovery mode
+            echo "🔍 Using dynamic discovery mode"
+            page=1
+            repos_found=0
+          
+          while [ "${repos_found}" -lt "${MAX_REPOS}" ] || [ "${MAX_REPOS}" = "0" ]; do
+            # Get repos from organization
+            response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/orgs/${ORG_NAME}/repos?type=all&page=${page}&per_page=100&sort=updated")
+            
+            if [ "$(echo "${response}" | tail -n1)" = "401" ]; then
+              echo "❌ Authentication failed (HTTP 401) when listing organization repositories"
+              echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' scope via the 'github_token' input."
+              break
+            fi
+            
+            http_code=$(echo "${response}" | tail -n1)
+            body=$(echo "${response}" | head -n-1)
+            
+            if [ "${http_code}" != "200" ]; then
+              echo "⚠️ API error ${http_code}, stopping discovery"
+              break
+            fi
+            
+            repos_batch=$(echo "${body}" | jq -r '.[].full_name' || echo "")
+            
+            if [ -z "${repos_batch}" ] || [ "${repos_batch}" = "null" ]; then
+              break
+            fi
+            
+            # Check each repo for open Dependabot alerts
+            while IFS= read -r repo_full_name; do
+              if [ -z "${repo_full_name}" ]; then
+                continue
+              fi
+              
+              # Filter: Only process repos in the ALLOWED_REPOS whitelist
+              is_allowed=false
+              for allowed_repo in "${ALLOWED_REPOS[@]}"; do
+                if [ "${repo_full_name}" = "${allowed_repo}" ]; then
+                  is_allowed=true
+                  break
+                fi
+              done
+              
+              if [ "${is_allowed}" = "false" ]; then
+                echo "⏭️  Skipping ${repo_full_name} (not in allowed repos whitelist)"
+                continue
+              fi
+              
+              echo "🔍 Checking ${repo_full_name} for open Dependabot alerts..."
+
+              # First, check if the repository exists and is accessible
+              repo_check_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}")
+              
+              repo_check_code=$(echo "${repo_check_response}" | tail -n1)
+              repo_check_body=$(echo "${repo_check_response}" | head -n-1)
+              
+              if [ "${repo_check_code}" = "200" ]; then
+                echo "✅ Repository ${repo_full_name} found."
+              elif [ "${repo_check_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) for ${repo_full_name}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo_full_name}"
+                continue
+              elif [ "${repo_check_code}" = "404" ]; then
+                echo "⚠️ Repository ${repo_full_name} not found or no access, skipping. Response body: ${repo_check_body}"
+                continue
+              else
+                echo "⚠️ Error checking repository ${repo_full_name} existence: HTTP ${repo_check_code}, skipping. Response body: ${repo_check_body}"
+                continue
+              fi
+
+              # Check if Dependabot alerts are enabled for the repo
+              dependabot_status_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}/dependabot/alerts?per_page=1") # Just check if endpoint is accessible
+              
+              dependabot_status_code=$(echo "${dependabot_status_response}" | tail -n1)
+              dependabot_status_body=$(echo "${dependabot_status_response}" | head -n-1)
+
+              if [ "${dependabot_status_code}" = "403" ]; then
+                echo "⚠️ Dependabot alerts are not enabled for ${repo_full_name} or token lacks 'security_events:read' permission, skipping. Response body: ${dependabot_status_body}"
+                continue
+              elif [ "${dependabot_status_code}" = "401" ]; then
+                echo "❌ Authentication failed (HTTP 401) when checking Dependabot alerts for ${repo_full_name}"
+                echo "   💡 Solution: Provide a Personal Access Token (PAT) with 'repo' and 'security_events' scopes via the 'github_token' input."
+                echo "   Skipping ${repo_full_name}"
+                continue
+              elif [ "${dependabot_status_code}" != "200" ]; then
+                echo "⚠️ Error checking Dependabot alerts status for ${repo_full_name}: HTTP ${dependabot_status_code}, skipping. Response body: ${dependabot_status_body}"
+                continue
+              fi
+
+              # Check if repo has open Dependabot alerts
+              alerts_response=$(curl -s -w "\n%{http_code}" --max-time 60 \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "https://api.github.com/repos/${repo_full_name}/dependabot/alerts?state=open&per_page=100")
+              
+              alerts_code=$(echo "${alerts_response}" | tail -n1)
+              alerts_body=$(echo "${alerts_response}" | head -n-1)
+              
+              if [ "${alerts_code}" = "200" ]; then
+                actual_count=$(echo "${alerts_body}" | jq 'if type == "array" then length else 0 end' || echo "0")
+                
+                if [ "${actual_count}" -gt 0 ]; then
+                  echo "✅ Found ${actual_count} open Dependabot alerts in ${repo_full_name}"
+                  repos_json=$(echo "${repos_json}" | jq --arg repo "${repo_full_name}" --arg count "${actual_count}" '. + [{"repo": $repo, "alert_count": ($count | tonumber)}]')
+                  repos_found=$((repos_found + 1))
+                  
+                  if [ "${MAX_REPOS}" != "0" ] && [ "${repos_found}" -ge "${MAX_REPOS}" ]; then
+                    break 2
+                  fi
+                else
+                  echo "ℹ️  No open Dependabot alerts from Dependabot in ${repo_full_name}, skipping. Response body: ${alerts_body}"
+                fi
+              else
+                echo "⚠️  Error fetching Dependabot alerts for ${repo_full_name}: HTTP ${alerts_code}, skipping. Response body: ${alerts_body}"
+              fi
+            done <<< "${repos_batch}"
+            
+            page=$((page + 1))
+            done
+          fi
+          
+          echo "${repos_json}" | jq .
+          echo "📊 Total repositories with open Dependabot alerts: $(echo "${repos_json}" | jq 'length')"
+          
+          # Set output
+          echo "repos<<EOF" >> $GITHUB_OUTPUT
+          echo "${repos_json}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Set repos output
+        id: set-repos
+        run: |
+          repos='${{ steps.discover.outputs.repos }}'
+          if [ -z "${repos}" ] || [ "${repos}" = "null" ] || [ "${repos}" = "" ]; then
+            repos="[]"
+          fi
+          # Use multi-line EOF syntax for JSON arrays to avoid "Invalid format" errors
+          echo "repos<<EOF" >> $GITHUB_OUTPUT
+          echo "${repos}" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "📊 Repos to process: $(echo "${repos}" | jq 'length' || echo "0")"
+
+  triage-dependabot-alerts:
+    needs: discover-repos-with-dependabot-alerts
+    if: needs.discover-repos-with-dependabot-alerts.outputs.repos != '[]' && needs.discover-repos-with-dependabot-alerts.outputs.repos != 'null' && needs.discover-repos-with-dependabot-alerts.outputs.repos != ''
+    strategy:
+      matrix:
+        repo: ${{ fromJson(needs.discover-repos-with-dependabot-alerts.outputs.repos) }}
+      fail-fast: false
+      # github.event.inputs so schedule + workflow_dispatch both resolve defaults
+      max-parallel: ${{ fromJSON(github.event.inputs.matrix_max_parallel || '2') }}
+    runs-on: appdirect-self-hosted-java-large-runner
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      security-events: write # Needed to dismiss alerts
+    env:
+      TARGET_REPO: ${{ matrix.repo.repo }}
+      MAX_ALERTS: ${{ inputs.max_alerts_per_repo || '300' }}
+      AUTO_DISMISS: ${{ inputs.auto_dismiss == true && 'true' || 'false' }}
+    steps:
+      - name: Parse repository owner and name
+        id: parse-repo
+        run: |
+          REPO_FULL="${{ matrix.repo.repo }}"
+          OWNER=$(echo "${REPO_FULL}" | cut -d'/' -f1)
+          REPO=$(echo "${REPO_FULL}" | cut -d'/' -f2)
+          
+          echo "owner=${OWNER}" >> $GITHUB_OUTPUT
+          echo "repo=${REPO}" >> $GITHUB_OUTPUT
+          echo "📂 Processing: ${OWNER}/${REPO}"
+
+      - name: Set up token for triage
+        id: token-triage
+        run: |
+          # Use PAT secret if available, otherwise use GITHUB_TOKEN
+          if [ -n "${PAT_TOKEN}" ] && [ "${PAT_TOKEN}" != "" ]; then
+            echo "🔑 Using Personal Access Token (PAT) from secret for triage"
+            echo "token=${PAT_TOKEN}" >> $GITHUB_OUTPUT
+          else
+            echo "🔑 Using GITHUB_TOKEN for triage"
+            echo "token=${GITHUB_TOKEN}" >> $GITHUB_OUTPUT
+          fi
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+
+      - name: Checkout current repository (for script)
+        uses: actions/checkout@v4
+        with:
+          path: .
+          fetch-depth: 0
+          submodules: false
+
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repo.repo }}
+          path: target-repo
+          fetch-depth: 0
+          token: ${{ steps.token-triage.outputs.token }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq curl python3
+
+      - name: Install Cursor Agent CLI
+        run: |
+          curl -fsS https://cursor.com/install | bash
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          echo "$HOME/.cursor/bin" >> $GITHUB_PATH
+
+      - name: Validate Cursor
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: ${{ github.event.inputs.cursor_model || 'auto' }}
+        run: |
+          cursor-agent --trust --print --model "${CURSOR_MODEL}" --output-format text "ping" >/dev/null
+          echo "✅ Cursor agent ready"
+
+      - name: Verify and prepare triage script
+        run: |
+          # Script is in the same repo as the workflow (automatically checked out by GitHub Actions)
+          SCRIPT_PATH=".github/tools/dependabot_cursor_triage.sh"
+          if [ ! -f "${SCRIPT_PATH}" ]; then
+            echo "❌ Triage script not found at ${SCRIPT_PATH}"
+            echo "📂 Current directory: $(pwd)"
+            echo "📂 Available files in .github/tools/:"
+            ls -la .github/tools/ || echo "Directory does not exist"
+            exit 1
+          fi
+          chmod +x "${SCRIPT_PATH}"
+          echo "✅ Triage script found and made executable at: $(realpath "${SCRIPT_PATH}")"
+
+      - name: Run AI Triage on Dependabot alerts
+        working-directory: target-repo
+        env:
+          OWNER: ${{ steps.parse-repo.outputs.owner }}
+          REPO: ${{ steps.parse-repo.outputs.repo }}
+          GITHUB_TOKEN: ${{ steps.token-triage.outputs.token }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CURSOR_MODEL: ${{ github.event.inputs.cursor_model || 'auto' }}
+          CURSOR_MAX_RETRIES: ${{ github.event.inputs.cursor_max_retries || '5' }}
+          CURSOR_RETRY_DELAY_SEC: ${{ github.event.inputs.cursor_retry_delay_sec || '20' }}
+          ALLOW_PHASE1_FALLBACK: ${{ github.event.inputs.allow_phase1_fallback == 'true' && 'true' || 'false' }}
+          AUTO_DISMISS_MIN_CERTAINTY: ${{ github.event.inputs.auto_dismiss_min_certainty || '0' }}
+          ALERT_STATE: "open"
+          MAX_ALERTS: ${{ env.MAX_ALERTS }}
+          AUTO_DISMISS: ${{ env.AUTO_DISMISS }}
+        run: |
+          echo "🤖 Starting AI triage for Dependabot alerts in ${OWNER}/${REPO}"
+          echo "📊 Alert count: ${{ matrix.repo.alert_count }}"
+          echo "📂 Working directory: $(pwd)"
+          
+          # Script is in the workspace root (same repo as workflow)
+          # From target-repo, go up one level to workspace root
+          SCRIPT_PATH="../.github/tools/dependabot_cursor_triage.sh"
+          
+          # Verify script exists before running
+          if [ ! -f "${SCRIPT_PATH}" ]; then
+            echo "❌ Script not found at ${SCRIPT_PATH}"
+            echo "Current directory: $(pwd)"
+            echo "Parent directory contents:"
+            ls -la ../
+            echo "Looking for script at: $(realpath "${SCRIPT_PATH}" 2>/dev/null || echo "path not found")"
+            exit 1
+          fi
+          
+          echo "✅ Script found at: $(realpath "${SCRIPT_PATH}")"
+          
+          # Run the triage script
+          bash "${SCRIPT_PATH}"
+
+      - name: Upload triage results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependabot-triage-results-${{ steps.parse-repo.outputs.owner }}-${{ steps.parse-repo.outputs.repo }}
+          path: |
+            target-repo/dependabot-triage-results.json
+            target-repo/dependabot-triage-summary.json
+            target-repo/repository_dependency_profile.txt
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Summary for repository
+        if: always()
+        run: |
+          if [ -f "target-repo/dependabot-triage-summary.json" ]; then
+            fetched=$(jq -r '.total_alerts_fetched' target-repo/dependabot-triage-summary.json)
+            analyzed=$(jq -r '.alerts_analyzed' target-repo/dependabot-triage-summary.json)
+            tp_count=$(jq -r '.true_positives' target-repo/dependabot-triage-summary.json)
+            fp_count=$(jq -r '.false_positives_detected' target-repo/dependabot-triage-summary.json)
+            uncertain=$(jq -r '.needs_review' target-repo/dependabot-triage-summary.json)
+            dismissed_count=$(jq -r '.dismissed_via_api' target-repo/dependabot-triage-summary.json)
+            echo "## 📊 Dependabot Triage: ${{ matrix.repo.repo }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|------:|" >> $GITHUB_STEP_SUMMARY
+            echo "| Total alerts (open, fetched) | ${fetched} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Alerts analyzed end-to-end | ${analyzed} |" >> $GITHUB_STEP_SUMMARY
+            echo "| True positives | ${tp_count} |" >> $GITHUB_STEP_SUMMARY
+            echo "| False positives (AI-detected) | ${fp_count} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Needs review | ${uncertain} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Dismissed via API | ${dismissed_count} |" >> $GITHUB_STEP_SUMMARY
+          elif [ -f "target-repo/dependabot-triage-results.json" ]; then
+            total=$(jq 'length' target-repo/dependabot-triage-results.json)
+            tp_count=$(jq '[.[] | select(.ai_label == "real_issue")] | length' target-repo/dependabot-triage-results.json)
+            fp_count=$(jq '[.[] | select(.ai_label == "likely_false_positive")] | length' target-repo/dependabot-triage-results.json)
+            dismissed_count=$(jq '[.[] | select(.dismissed == true)] | length' target-repo/dependabot-triage-results.json)
+            echo "## 📊 Dependabot Triage Results: ${{ matrix.repo.repo }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Alerts analyzed:** ${total}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Real issues:** ${tp_count}" >> $GITHUB_STEP_SUMMARY
+            echo "- **False positives (detected):** ${fp_count}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Dismissed via API:** ${dismissed_count}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No results file found for ${{ matrix.repo.repo }}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  final-summary:
+    needs: [discover-repos-with-dependabot-alerts, triage-dependabot-alerts]
+    if: always()
+    runs-on: appdirect-self-hosted-java-large-runner
+    steps:
+      - name: Generate final summary
+        run: |
+          echo "# 🎉 Dependency Review Orchestrator Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repositories processed:** Check individual job results above" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review triage results in artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "2. Check dismissed alerts in Security tab (Dependabot alerts) of each repository" >> $GITHUB_STEP_SUMMARY
+          echo "3. Address real issues identified by AI triage" >> $GITHUB_STEP_SUMMARY
+
